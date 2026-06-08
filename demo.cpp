@@ -45,6 +45,7 @@ bool DemoMd::start() {
 }
 
 void DemoMd::stop() {
+    publish_stats();
     if (tailer_) {
         tailer_->stop();
         tailer_.reset();
@@ -71,11 +72,30 @@ void DemoMd::on_md(const MDUniOrder& order) {
     uint64_t heartbeat = now_ns();
     bool in_window = mdsys::is_in_trading_window(order.recvTime);
 
+    // Monitoring counters accumulate in writer-local variables and are flushed
+    // to shared memory only every kStatsPublishInterval ticks. This keeps the
+    // contended status cache lines off the per-tick path (no lock-prefixed RMW,
+    // no cross-core load of durable_wal_seq on the hot path).
+    ++local_received_;
+    if (in_window) {
+        ++local_in_window_;
+    }
+    if ((seq & (mdsys::kStatsPublishInterval - 1)) == 0) {
+        ctx->ctrl->status.writer.total_ticks_received.store(local_received_,
+                                                            std::memory_order_relaxed);
+        ctx->ctrl->status.writer.total_ticks_in_window.store(local_in_window_,
+                                                             std::memory_order_relaxed);
+        durable_view_ =
+            ctx->ctrl->status.tailer.durable_wal_seq.load(std::memory_order_relaxed);
+    }
+
     // If the tailer falls a full log behind, the circular day log may overwrite
     // data that has not been durably written yet. Production should fail closed.
-    if (seq - ctx->ctrl->status.durable_wal_seq.load(std::memory_order_relaxed) >=
-        mdsys::kLogCapacity) {
-        ctx->ctrl->status.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
+    // durable_view_ is a cached value (up to kStatsPublishInterval ticks stale),
+    // which only makes this guard more conservative.
+    if (seq - durable_view_ >= mdsys::kLogCapacity) {
+        ctx->ctrl->status.tailer.daylog_overwrite_count.fetch_add(
+            1, std::memory_order_relaxed);
     }
 
     // GlobalDayLog is the ordered full-market stream. Storage consumes it by
@@ -107,13 +127,25 @@ void DemoMd::on_md(const MDUniOrder& order) {
     ring.header.write_seq.store(local_seq + 1, std::memory_order_release);
 
     // committed_seq is the canonical progress counter for both the tailer and
-    // strategy readers; do not duplicate it into RuntimeStatus.
+    // strategy readers; do not duplicate it into RuntimeStatus. Both fields live
+    // on the writer-owned ShmHeader cache line, so these stores stay local.
     ctx->ctrl->header.committed_seq.store(seq + 1, std::memory_order_release);
     ctx->ctrl->header.writer_heartbeat.store(heartbeat, std::memory_order_release);
-    ctx->ctrl->status.total_ticks_received.fetch_add(1, std::memory_order_relaxed);
-    if (in_window) {
-        ctx->ctrl->status.total_ticks_in_window.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DemoMd::publish_stats() {
+    if (shm_ == nullptr) {
+        return;
     }
+    mdsys::ShmContext* ctx = shm_->context();
+    if (ctx == nullptr || ctx->ctrl == nullptr) {
+        return;
+    }
+    // Flush final accumulator values so monitors see exact totals after a run.
+    ctx->ctrl->status.writer.total_ticks_received.store(local_received_,
+                                                        std::memory_order_relaxed);
+    ctx->ctrl->status.writer.total_ticks_in_window.store(local_in_window_,
+                                                         std::memory_order_relaxed);
 }
 
 int32_t DemoMd::get_or_register_instrument(int32_t instrument_id) {

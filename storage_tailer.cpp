@@ -65,20 +65,25 @@ void StorageTailer::run() {
         // committed) and never blocks the writer.
         uint64_t committed = ctx_->ctrl->header.committed_seq.load(std::memory_order_acquire);
         if (next_read_seq_ >= committed) {
+            // Idle: flush any buffered tail so durability lag stays bounded even
+            // when the buffer never reaches the batch threshold (low volume).
+            if (!buffer_.empty()) {
+                flush_buffer();
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             continue;
         }
 
-        uint64_t durable = ctx_->ctrl->status.durable_wal_seq.load(std::memory_order_relaxed);
+        uint64_t durable = ctx_->ctrl->status.tailer.durable_wal_seq.load(std::memory_order_relaxed);
         if (committed - durable > kLogCapacity) {
-            ctx_->ctrl->status.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
+            ctx_->ctrl->status.tailer.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
         }
 
         while (next_read_seq_ < committed) {
             TickRecord& rec = ctx_->daylog->records[next_read_seq_ % kLogCapacity];
             // Verify the circular slot has not already been overwritten.
             if (rec.global_seq != next_read_seq_) {
-                ctx_->ctrl->status.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
+                ctx_->ctrl->status.tailer.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
                 ++next_read_seq_;
                 continue;
             }
@@ -87,14 +92,14 @@ void StorageTailer::run() {
                 buffer_.push_back(rec);
             }
             ++next_read_seq_;
-            // written_wal_seq is a monitoring counter; update once per batch
-            // rather than on every tick to avoid a per-tick atomic store here.
             if (buffer_.size() >= 4096) {
                 flush_buffer();
             }
         }
-        // Publish how far the tailer has read after draining this batch.
-        ctx_->ctrl->status.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
+        // Publish read progress once per drained batch (monitoring only). This
+        // is NOT durability: durable_wal_seq advances only after fsync in
+        // flush_buffer().
+        ctx_->ctrl->status.tailer.written_wal_seq.store(next_read_seq_, std::memory_order_release);
     }
 }
 
@@ -132,7 +137,7 @@ bool StorageTailer::flush_buffer() {
     }
     // In this DEV_MOCK implementation durable means fsync completed for the
     // buffered WAL batch. A production O_DIRECT path would track this separately.
-    ctx_->ctrl->status.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
+    ctx_->ctrl->status.tailer.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
     buffer_.clear();
     return true;
 }

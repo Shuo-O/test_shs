@@ -47,19 +47,51 @@ struct alignas(64) ShmHeader {
     uint8_t _pad[16];
 };
 
-// Runtime counters intentionally live in shared memory so external processes
-// can monitor ingestion, persistence, and reader health without RPC.
+// Runtime counters live in shared memory so external processes can monitor
+// ingestion, persistence, and reader health without RPC. The counters are
+// grouped by *writer* onto separate cache lines: the ingest writer, the storage
+// tailer, and strategy readers each touch a different line, so monitoring
+// traffic never bounces the cache line the on_md hot path is writing.
 // committed_seq is NOT duplicated here; read it from ShmHeader::committed_seq.
-struct alignas(64) RuntimeStatus {
-    std::atomic<uint64_t> durable_wal_seq;          // last seq flushed to disk
+
+// Written only by the single ingest writer (published periodically, not per
+// tick). Isolated so the hot path never shares this line with other actors.
+struct alignas(64) WriterStats {
     std::atomic<uint64_t> total_ticks_received;
     std::atomic<uint64_t> total_ticks_in_window;
-    std::atomic<uint64_t> reader_retry_count;       // seqlock retries by readers
-    std::atomic<uint64_t> ring_overwrite_count;     // reader-detected overwrites
-    std::atomic<uint64_t> daylog_overwrite_count;   // daylog circular overwrite
-    uint64_t              _pad[2];                  // keep struct = 64 B
+    uint64_t              _pad[6];
 };
-static_assert(sizeof(RuntimeStatus) == 64, "RuntimeStatus must be one cache line");
+
+// Written by the storage tailer. written_wal_seq is read progress (how far the
+// tailer has consumed the day log); durable_wal_seq is fsync progress and is
+// the value the writer's overwrite guard trusts. They are distinct: read
+// progress may run ahead of what is durably on disk.
+struct alignas(64) TailerStats {
+    std::atomic<uint64_t> written_wal_seq;          // daylog read cursor
+    std::atomic<uint64_t> durable_wal_seq;          // last seq fsynced to disk
+    std::atomic<uint64_t> daylog_overwrite_count;   // daylog circular overwrite
+    uint64_t              _pad[5];
+};
+
+// Reader-side metrics (seqlock retries, detected overwrites) intentionally do
+// NOT live here: strategy processes map the data segments read-only, so they
+// cannot write shared counters. query_latest_n reports them through a
+// caller-owned QueryStats instead (see strategy_reader.h).
+struct RuntimeStatus {
+    WriterStats writer;
+    TailerStats tailer;
+};
+
+static_assert(sizeof(WriterStats) == 64, "WriterStats must be one cache line");
+static_assert(sizeof(TailerStats) == 64, "TailerStats must be one cache line");
+static_assert(sizeof(RuntimeStatus) == 128, "RuntimeStatus = 2 cache lines");
+
+// The writer publishes monitoring counters and refreshes its cached view of
+// durable_wal_seq once every kStatsPublishInterval ticks, keeping per-tick
+// work off the shared status cache lines. Must be a power of two.
+constexpr uint64_t kStatsPublishInterval = 4096;
+static_assert((kStatsPublishInterval & (kStatsPublishInterval - 1)) == 0,
+              "kStatsPublishInterval must be a power of two");
 
 struct ControlSegment {
     ShmHeader header;

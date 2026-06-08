@@ -2,10 +2,12 @@
 #include "shm_manager.h"
 #include "strategy_reader.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -89,7 +91,7 @@ void test_latest_n_and_wal() {
 
     uint64_t wal_rows = count_wal_records(wal_dir);
     assert(wal_rows == expected_in_window);
-    assert(md.context()->ctrl->status.durable_wal_seq.load() ==
+    assert(md.context()->ctrl->status.tailer.durable_wal_seq.load() ==
            1500 + static_cast<uint64_t>(mdsys::kRingCapacity) + 6);
 
     reader.close();
@@ -99,10 +101,98 @@ void test_latest_n_and_wal() {
     }
 }
 
+// make_order encodes the same sequence number into multiple fields. A
+// torn seqlock read (mixing two writer epochs) breaks this invariant, so it
+// doubles as a torn-read detector under concurrency. Returns the encoded seq.
+int64_t check_record_invariant(const MDUniOrder& o) {
+    int64_t seq = o.bizSeq;
+    assert(o.price == 100000 + seq && "torn read: price/bizSeq mismatch");
+    assert(o.qty == 10 + seq && "torn read: qty/bizSeq mismatch");
+    assert(o.orderSeq == static_cast<uint32_t>(seq) && "torn read: orderSeq mismatch");
+    assert(o.orderId == static_cast<uint32_t>(1000000 + seq) && "torn read: orderId mismatch");
+    return seq;
+}
+
+// Stress the seqlock with one writer and several concurrent readers. On a weak
+// memory model (this runs on arm64) a missing writer/reader fence would let a
+// torn read slip past the version check and trip check_record_invariant.
+void test_concurrent_seqlock() {
+    const std::filesystem::path wal_dir = "test_wal_concurrent";
+    std::filesystem::remove_all(wal_dir);
+    mdsys::ShmManager::unlink_all();
+
+    DemoMd md(wal_dir.string(), 20260608, true);
+    assert(md.start() && "DemoMd failed to start");
+
+    const int32_t kSymbol = 600000;
+    const int64_t kWrites = 2'000'000;
+    md.on_md(make_order(kSymbol, 0));  // register the symbol before readers run
+
+    std::atomic<bool> done{false};
+    std::atomic<uint64_t> reads_ok{0};
+    std::atomic<uint64_t> total_retries{0};
+    std::atomic<uint64_t> total_overwrites{0};
+
+    // Strategy readers map the data segments read-only, exactly as a separate
+    // process would, proving query_latest_n never writes through ctx.
+    mdsys::ShmManager reader_shm;
+    assert(reader_shm.open(false, true) && "reader failed to open shared memory");
+    const mdsys::ShmContext* rctx = reader_shm.context();
+
+    auto reader_fn = [&]() {
+        std::vector<MDUniOrder> buf(256);
+        int count = 0;
+        mdsys::QueryStats qs;  // process/thread-local, not shared memory
+        while (!done.load(std::memory_order_acquire)) {
+            int rc = mdsys::query_latest_n(rctx, kSymbol, 256, buf.data(), &count, &qs);
+            if (rc == mdsys::kErrOverwriteDetected) {
+                continue;  // writer wrapped mid-copy; legitimate, just retry
+            }
+            assert(rc == mdsys::kOk);
+            int64_t prev = -1;
+            for (int i = 0; i < count; ++i) {
+                int64_t seq = check_record_invariant(buf[i]);
+                // Records must be returned in arrival order, strictly +1 apart.
+                if (prev >= 0) {
+                    assert(seq == prev + 1 && "records not consecutive");
+                }
+                prev = seq;
+            }
+            reads_ok.fetch_add(1, std::memory_order_relaxed);
+        }
+        total_retries.fetch_add(qs.seqlock_retries, std::memory_order_relaxed);
+        total_overwrites.fetch_add(qs.overwrites_detected, std::memory_order_relaxed);
+    };
+
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back(reader_fn);
+    }
+
+    for (int64_t s = 1; s < kWrites; ++s) {
+        md.on_md(make_order(kSymbol, static_cast<int32_t>(s)));
+    }
+    done.store(true, std::memory_order_release);
+    for (auto& t : readers) {
+        t.join();
+    }
+
+    assert(reads_ok.load() > 0 && "readers never completed a query");
+    std::cout << "concurrent: " << reads_ok.load() << " consistent reads, retries="
+              << total_retries.load() << " overwrites=" << total_overwrites.load()
+              << "\n";
+
+    reader_shm.close();
+    md.stop();
+    mdsys::ShmManager::unlink_all();
+    std::filesystem::remove_all(wal_dir);
+}
+
 }  // namespace
 
 int main() {
     test_latest_n_and_wal();
+    test_concurrent_seqlock();
     std::cout << "All tests passed\n";
     return 0;
 }

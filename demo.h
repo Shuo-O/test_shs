@@ -30,6 +30,7 @@ public:
 
 private:
     int32_t get_or_register_instrument(int32_t instrument_id);
+    void publish_stats();
 
     std::string wal_dir_;
     uint32_t trading_day_;
@@ -40,4 +41,10 @@ private:
     int32_t next_symbol_index_ = 0;
     bool started_ = false;
     std::string last_error_;
+
+    // Writer-local monitoring accumulators. Single-writer, so these need no
+    // atomics; they are published to shared memory periodically (see on_md).
+    uint64_t local_received_ = 0;
+    uint64_t local_in_window_ = 0;
+    uint64_t durable_view_ = 0;  // cached durable_wal_seq, refreshed periodically
 };

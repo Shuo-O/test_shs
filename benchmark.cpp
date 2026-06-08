@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
 
     uint64_t wal_rows = count_wal_records(options.wal_dir);
     uint64_t committed = md.context()->ctrl->header.committed_seq.load();
-    uint64_t durable = md.context()->ctrl->status.durable_wal_seq.load();
+    uint64_t durable = md.context()->ctrl->status.tailer.durable_wal_seq.load();
 
     std::cout << "BENCHMARK_RESULT\n";
     std::cout << "rows=" << options.rows << "\n";
@@ -210,7 +210,7 @@ int main(int argc, char** argv) {
     std::cout << "committed_seq=" << committed << "\n";
     std::cout << "durable_wal_seq=" << durable << "\n";
     std::cout << "daylog_overwrite_count="
-              << md.context()->ctrl->status.daylog_overwrite_count.load() << "\n";
+              << md.context()->ctrl->status.tailer.daylog_overwrite_count.load() << "\n";
 
     reader.close();
     mdsys::ShmManager::unlink_all();

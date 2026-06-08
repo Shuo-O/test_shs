@@ -7,11 +7,22 @@
 
 namespace mdsys {
 
+// Caller-owned reader metrics. Strategy processes map shared memory read-only
+// and therefore cannot publish counters into it; instead they pass an optional
+// QueryStats so each reader accumulates its own retry/overwrite totals and can
+// export them however it likes. Single-threaded per instance (one per reader
+// thread), so the fields are plain integers.
+struct QueryStats {
+    uint64_t seqlock_retries = 0;     // slots that needed at least one retry
+    uint64_t overwrites_detected = 0; // queries aborted due to ring wrap
+};
+
 inline int query_latest_n(const ShmContext* ctx,
                           int32_t instrument_id,
                           int n,
                           MDUniOrder* out_buf,
-                          int* out_count) {
+                          int* out_count,
+                          QueryStats* stats = nullptr) {
     if (out_count != nullptr) {
         *out_count = 0;
     }
@@ -65,6 +76,9 @@ inline int query_latest_n(const ShmContext* ctx,
 
             if (v1 == v2 && (v2 & 1u) == 0) {
                 if (local_seq != expected_seq) {
+                    if (stats != nullptr) {
+                        ++stats->overwrites_detected;
+                    }
                     return kErrOverwriteDetected;
                 }
                 out_buf[i] = order;
@@ -73,8 +87,8 @@ inline int query_latest_n(const ShmContext* ctx,
             MDSYS_CPU_RELAX();
             retried = true;
         }
-        if (retried) {
-            ctx->ctrl->status.reader_retry_count.fetch_add(1, std::memory_order_relaxed);
+        if (retried && stats != nullptr) {
+            ++stats->seqlock_retries;
         }
     }
 
@@ -82,6 +96,9 @@ inline int query_latest_n(const ShmContext* ctx,
     // the copy and force callers to retry instead of returning mixed epochs.
     uint64_t write_seq_after = ring.header.write_seq.load(std::memory_order_acquire);
     if (write_seq_after - start_seq > static_cast<uint64_t>(kRingCapacity)) {
+        if (stats != nullptr) {
+            ++stats->overwrites_detected;
+        }
         return kErrOverwriteDetected;
     }
 
