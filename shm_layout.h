@@ -1,153 +1,156 @@
 #pragma once
 
+// Shared-memory layout. Everything here is POD: fixed arrays, integer offsets,
+// and lock-free atomics only -- no STL containers, no process-local pointers --
+// so the region is valid across every process that maps it.
+//
+// Three independently mmap'd regions:
+//   ControlRegion : superblock + id index + writer/tailer stat lines  (~3.8 MiB)
+//   RingRegion    : per-symbol seqlock rings for latest-n queries     (4.88 GiB)
+//   LogRegion     : append-only day log consumed by the storage tailer (32 GiB)
+// Strategy processes map Control + Rings read-only and never touch the log.
+
 #include "config.h"
 #include "md.h"
 
 #include <atomic>
 #include <cstdint>
 
-// Portable spin-wait hint: reduces pipeline pressure and cache-line bouncing
-// during seqlock retries.  On x86 this emits PAUSE; on ARM it emits YIELD.
+// Portable spin hint for seqlock retry loops (PAUSE / YIELD).
 #if defined(__x86_64__) || defined(__i386__)
-#  define MDSYS_CPU_RELAX() __asm__ __volatile__("pause" ::: "memory")
+#  define MDSYS_RELAX() __asm__ __volatile__("pause" ::: "memory")
 #elif defined(__aarch64__) || defined(__arm__)
-#  define MDSYS_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#  define MDSYS_RELAX() __asm__ __volatile__("yield" ::: "memory")
 #else
 #  include <thread>
-#  define MDSYS_CPU_RELAX() std::this_thread::yield()
+#  define MDSYS_RELAX() std::this_thread::yield()
 #endif
 
 namespace mdsys {
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free,
-              "shared-memory uint64 atomics must be lock-free");
+              "shared uint64 atomics must be lock-free");
 static_assert(sizeof(MDUniOrder) == 40, "MDUniOrder ABI changed");
 
-// Negative values are reserved for reader-facing API errors.
-enum MdError {
-    kOk = 0,
-    kErrUnknownInstrument = -1,
-    kErrOverwriteDetected = -2,
-    kErrStaleWriter = -3,
-    kErrInvalidArgument = -4,
-    kErrNoCapacity = -5,
+enum QueryError : int {
+    kOk               = 0,
+    kErrBadArg        = -1,
+    kErrUnknownSymbol = -2,
+    kErrOverwritten   = -3,  // ring wrapped under the reader
 };
 
-// Control metadata is mapped by both writer and readers. committed_seq is an
-// exclusive end: records in [0, committed_seq) have been published.
-struct alignas(64) ShmHeader {
+// --- Control region, cache-line partitioned by access pattern --------------
+
+// Line 0: static metadata, written once at init then read-only. Carries the
+// clock anchor used to convert raw recv_ticks to wall-clock ns offline.
+struct alignas(64) Superblock {
     uint64_t magic;
     uint32_t abi_version;
-    uint32_t trading_day;
-    std::atomic<uint64_t> committed_seq;     // exclusive end: [0, committed_seq)
-    std::atomic<uint64_t> writer_heartbeat;  // nanoseconds from steady clock
-    uint32_t instrument_count;
+    uint32_t trading_day;        // YYYYMMDD
+    uint32_t instrument_count;   // registered symbols
     uint32_t ring_capacity;
     uint64_t log_capacity;
-    uint8_t _pad[16];
+    uint64_t epoch_ns_at_start;  // wall-clock anchor (ns)
+    uint64_t ticks_at_start;     // fast_ticks() anchor
+    uint64_t ticks_per_sec;      // fast clock frequency
+    uint8_t  _pad[8];
 };
+static_assert(sizeof(Superblock) == 64, "Superblock must be one cache line");
 
-// Runtime counters live in shared memory so external processes can monitor
-// ingestion, persistence, and reader health without RPC. The counters are
-// grouped by *writer* onto separate cache lines: the ingest writer, the storage
-// tailer, and strategy readers each touch a different line, so monitoring
-// traffic never bounces the cache line the on_md hot path is writing.
-// committed_seq is NOT duplicated here; read it from ShmHeader::committed_seq.
+// Line 1: the writer's hot publication. committed_seq is the canonical exclusive
+// end of the day log; records in [0, committed_seq) are visible to the tailer.
+struct alignas(64) WriterControl {
+    std::atomic<uint64_t> committed_seq;
+    std::atomic<uint64_t> heartbeat_ticks;
+    uint8_t _pad[48];
+};
+static_assert(sizeof(WriterControl) == 64, "WriterControl must be one cache line");
 
-// Written only by the single ingest writer (published periodically, not per
-// tick). Isolated so the hot path never shares this line with other actors.
+// Line 2: writer-only monitoring counters, published on a stride so the hot path
+// keeps this line in M state (never shared with the tailer or readers).
 struct alignas(64) WriterStats {
-    std::atomic<uint64_t> total_ticks_received;
-    std::atomic<uint64_t> total_ticks_in_window;
-    uint64_t              _pad[6];
+    std::atomic<uint64_t> ticks_received;
+    std::atomic<uint64_t> ticks_in_window;
+    std::atomic<uint64_t> ticks_dropped;   // unknown / unregistered symbol
+    uint8_t _pad[40];
 };
-
-// Written by the storage tailer. written_wal_seq is read progress (how far the
-// tailer has consumed the day log); durable_wal_seq is fsync progress and is
-// the value the writer's overwrite guard trusts. They are distinct: read
-// progress may run ahead of what is durably on disk.
-struct alignas(64) TailerStats {
-    std::atomic<uint64_t> written_wal_seq;          // daylog read cursor
-    std::atomic<uint64_t> durable_wal_seq;          // last seq fsynced to disk
-    std::atomic<uint64_t> daylog_overwrite_count;   // daylog circular overwrite
-    uint64_t              _pad[5];
-};
-
-// Reader-side metrics (seqlock retries, detected overwrites) intentionally do
-// NOT live here: strategy processes map the data segments read-only, so they
-// cannot write shared counters. query_latest_n reports them through a
-// caller-owned QueryStats instead (see strategy_reader.h).
-struct RuntimeStatus {
-    WriterStats writer;
-    TailerStats tailer;
-};
-
 static_assert(sizeof(WriterStats) == 64, "WriterStats must be one cache line");
+
+// Line 3: tailer-owned progress. read_seq is the day-log consume cursor;
+// durable_seq advances only after fsync and is what the writer's overwrite guard
+// trusts. wal_faults is non-zero iff a WAL write/fsync has failed (fail-closed).
+struct alignas(64) TailerStats {
+    std::atomic<uint64_t> read_seq;
+    std::atomic<uint64_t> durable_seq;
+    std::atomic<uint64_t> log_overwrite_count;
+    std::atomic<uint64_t> wal_faults;
+    uint8_t _pad[32];
+};
 static_assert(sizeof(TailerStats) == 64, "TailerStats must be one cache line");
-static_assert(sizeof(RuntimeStatus) == 128, "RuntimeStatus = 2 cache lines");
 
-// The writer publishes monitoring counters and refreshes its cached view of
-// durable_wal_seq once every kStatsPublishInterval ticks, keeping per-tick
-// work off the shared status cache lines. Must be a power of two.
-constexpr uint64_t kStatsPublishInterval = 4096;
-static_assert((kStatsPublishInterval & (kStatsPublishInterval - 1)) == 0,
-              "kStatsPublishInterval must be a power of two");
-
-struct ControlSegment {
-    ShmHeader header;
-    // Direct indexing avoids hash-table branches and pointer chasing in the
-    // hot path. Invalid instruments map to kInvalidInstrumentIndex.
-    int32_t instrument_to_index[kIdArraySize];
-    RuntimeStatus status;
+struct ControlRegion {
+    Superblock    sb;
+    WriterControl wc;
+    WriterStats   wstats;
+    TailerStats   tstats;
+    // Direct id->index map. -1 == unregistered. Sized to the full code space.
+    int32_t       index[kIdSpace];
 };
 
-// One cache-line slot in a per-symbol ring. version is a seqlock:
-// odd means a writer is updating the slot, even means the payload is stable.
-struct alignas(64) TickSlot {
-    std::atomic<uint64_t> version;  // odd while writer is updating, even when stable
-    uint64_t local_seq;
-    uint64_t global_seq;
+// --- Per-symbol ring (seqlock) ---------------------------------------------
+
+// One cache line per slot. `seq` is the seqlock witness AND the slot's record
+// identity: while a writer fills position p it holds 2*(p+1)-1 (odd); once stable
+// it holds 2*(p+1) (even). The even value encodes the position, so a reader can
+// tell whether the slot still holds the record it asked for after a wrap.
+struct alignas(64) Slot {
+    std::atomic<uint64_t> seq;
+    uint64_t              global_seq;
+    MDUniOrder            order;
+    uint8_t               _pad[8];
+};
+static_assert(sizeof(Slot) == 64, "Slot must be one cache line");
+
+struct alignas(64) RingHead {
+    std::atomic<uint64_t> write_seq;  // exclusive end; latest record is write_seq-1
+    uint32_t              symbol_id;
+    uint8_t               _pad[52];
+};
+static_assert(sizeof(RingHead) == 64, "RingHead must be one cache line");
+
+struct Ring {
+    RingHead head;
+    Slot     slots[kRingCapacity];
+};
+
+struct RingRegion {
+    Ring rings[kInstrumentCount];
+};
+
+// --- Append-only day log / WAL record --------------------------------------
+
+struct alignas(64) LogRecord {
+    uint64_t   global_seq;
+    uint64_t   recv_ticks;  // raw fast_ticks(); convert to ns via the anchor
     MDUniOrder order;
+    uint32_t   crc32;
+    uint32_t   flags;
+};
+static_assert(sizeof(LogRecord) == 64, "LogRecord must be one cache line");
+
+struct LogRegion {
+    LogRecord records[kLogCapacity];
 };
 
-static_assert(sizeof(TickSlot) == 64, "TickSlot must stay one cache line");
+constexpr uint32_t kFlagValid    = 1u << 0;
+constexpr uint32_t kFlagInWindow = 1u << 1;
 
-// write_seq is also an exclusive end for this symbol. The latest record is
-// write_seq - 1 when write_seq > 0.
-struct alignas(64) PerSymbolRingHeader {
-    std::atomic<uint64_t> write_seq;  // exclusive end for this symbol
-    uint32_t symbol_id;
-    uint32_t _pad[13];
-};
-
-struct PerSymbolRing {
-    PerSymbolRingHeader header;
-    TickSlot slots[kRingCapacity];
-};
-
-struct RingSegment {
-    PerSymbolRing rings[kInstrumentCount];
-};
-
-// Append-only global stream used by the storage tailer. The array is circular,
-// so consumers must verify global_seq before trusting a slot.
-struct alignas(64) TickRecord {
-    uint64_t global_seq;
-    uint64_t recv_ns;
-    MDUniOrder order;
-    uint32_t crc32;
-    uint32_t flags;
-};
-
-static_assert(sizeof(TickRecord) == 64, "TickRecord must stay one cache line");
-
-struct DayLogSegment {
-    TickRecord records[kLogCapacity];
-};
-
-// The demo assumes recvTime is hhmmss-style integer time.
-inline bool is_in_trading_window(int32_t recv_time) {
+// 09:25:00 .. 15:00:00 inclusive, on the hhmmss-style recvTime field.
+inline bool in_trading_window(int32_t recv_time) {
     return recv_time >= 92500 && recv_time <= 150000;
 }
+
+// Even seqlock witness value for ring position p.
+inline uint64_t stable_seq_for(uint64_t position) { return (position + 1) << 1; }
 
 }  // namespace mdsys

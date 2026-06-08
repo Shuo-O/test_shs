@@ -1,8 +1,0 @@
-v2_test
-v2_bench
-bench_v2_wal/
-test_v2_wal/
-test_v2_wal_conc/
-wal_v2/
-parquet_v2_out/
-*.o

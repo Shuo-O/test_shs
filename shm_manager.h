@@ -7,46 +7,38 @@
 
 namespace mdsys {
 
-struct ShmContext {
-    ControlSegment* ctrl = nullptr;
-    RingSegment* rings = nullptr;
-    DayLogSegment* daylog = nullptr;
+// Pointers into the three mapped regions. A reader maps control+rings only.
+struct Mapping {
+    ControlRegion* ctrl = nullptr;
+    RingRegion*    rings = nullptr;
+    LogRegion*     log = nullptr;
 };
 
+// Owns the shm_open/mmap lifecycle for one process. The writer calls create();
+// strategy readers call open(read_only=true, with_log=false).
 class ShmManager {
 public:
     ShmManager() = default;
     ~ShmManager();
-
     ShmManager(const ShmManager&) = delete;
     ShmManager& operator=(const ShmManager&) = delete;
 
-    bool create(bool reset_existing, uint32_t trading_day);
-    bool open(bool include_daylog, bool read_only);
+    bool create(uint32_t trading_day);         // writer: fresh, zeroed, initialized
+    bool open(bool read_only, bool with_log);  // attach to an existing region
     void close();
 
-    ShmContext* context() { return &ctx_; }
-    const ShmContext* context() const { return &ctx_; }
-    const std::string& last_error() const { return last_error_; }
+    Mapping&       mapping()       { return map_; }
+    const Mapping& mapping() const { return map_; }
+    const std::string& error() const { return error_; }
 
-    static void unlink_all();
+    static void unlink();  // remove the named segments
 
 private:
-    bool map_segment(const char* name,
-                     size_t size,
-                     bool create_segment,
-                     bool read_only,
-                     void** out);
-    bool initialize(uint32_t trading_day);
+    bool map_one(const char* name, size_t size, bool create_it, bool read_only, void** out);
+    void initialize(uint32_t trading_day);
 
-    ShmContext ctx_;
-    size_t ctrl_size_ = sizeof(ControlSegment);
-    size_t rings_size_ = sizeof(RingSegment);
-    size_t daylog_size_ = sizeof(DayLogSegment);
-    bool has_ctrl_ = false;
-    bool has_rings_ = false;
-    bool has_daylog_ = false;
-    std::string last_error_;
+    Mapping map_;
+    std::string error_;
 };
 
 }  // namespace mdsys

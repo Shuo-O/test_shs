@@ -1,5 +1,9 @@
 #pragma once
 
+// Strategy-side query API. Header-only so strategy processes inline it. The
+// mapping may be read-only, so this code never writes through `ctrl`; per-reader
+// metrics go into a caller-owned QueryStats instead.
+
 #include "shm_layout.h"
 #include "shm_manager.h"
 
@@ -7,103 +11,77 @@
 
 namespace mdsys {
 
-// Caller-owned reader metrics. Strategy processes map shared memory read-only
-// and therefore cannot publish counters into it; instead they pass an optional
-// QueryStats so each reader accumulates its own retry/overwrite totals and can
-// export them however it likes. Single-threaded per instance (one per reader
-// thread), so the fields are plain integers.
+// Caller-owned, process-local reader metrics (read-only mappings cannot publish
+// counters into shared memory). One instance per reader thread; plain integers.
 struct QueryStats {
-    uint64_t seqlock_retries = 0;     // slots that needed at least one retry
-    uint64_t overwrites_detected = 0; // queries aborted due to ring wrap
+    uint64_t retries = 0;     // slots that needed at least one seqlock retry
+    uint64_t overwrites = 0;  // queries aborted because the ring wrapped
 };
 
-inline int query_latest_n(const ShmContext* ctx,
-                          int32_t instrument_id,
-                          int n,
-                          MDUniOrder* out_buf,
-                          int* out_count,
-                          QueryStats* stats = nullptr) {
-    if (out_count != nullptr) {
-        *out_count = 0;
+// Copy the latest min(n, available) records for `symbol` into out[], oldest
+// first. Returns the count, or a negative QueryError. `stats` is optional.
+inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
+                          MDUniOrder* out, QueryStats* stats = nullptr) {
+    if (m.ctrl == nullptr || m.rings == nullptr || out == nullptr || n <= 0) {
+        return kErrBadArg;
     }
-    if (ctx == nullptr || ctx->ctrl == nullptr || ctx->rings == nullptr ||
-        out_buf == nullptr || out_count == nullptr || n <= 0) {
-        return kErrInvalidArgument;
+    if (symbol < 0 || symbol >= kIdSpace) {
+        return kErrUnknownSymbol;
     }
-    if (instrument_id < 0 || instrument_id >= kIdArraySize) {
-        return kErrUnknownInstrument;
-    }
-
-    int32_t idx = ctx->ctrl->instrument_to_index[instrument_id];
+    int32_t idx = m.ctrl->index[symbol];
     if (idx < 0 || idx >= kInstrumentCount) {
-        return kErrUnknownInstrument;
+        return kErrUnknownSymbol;
     }
 
-    PerSymbolRing& ring = ctx->rings->rings[idx];
-    uint64_t write_seq = ring.header.write_seq.load(std::memory_order_acquire);
-    int available = static_cast<int>(std::min<uint64_t>(
-        write_seq, static_cast<uint64_t>(kRingCapacity)));
-    int actual = std::min(n, available);
-    uint64_t start_seq = write_seq - static_cast<uint64_t>(actual);
+    const Ring& ring = m.rings->rings[idx];
+    uint64_t write_seq = ring.head.write_seq.load(std::memory_order_acquire);
+    uint64_t avail = std::min<uint64_t>(write_seq, kRingCapacity);
+    int count = static_cast<int>(std::min<uint64_t>(avail, static_cast<uint64_t>(n)));
+    uint64_t start = write_seq - static_cast<uint64_t>(count);
 
-    for (int i = 0; i < actual; ++i) {
-        uint64_t expected_seq = start_seq + static_cast<uint64_t>(i);
-        TickSlot& slot = ring.slots[expected_seq & (kRingCapacity - 1)];
-
-        // Seqlock read loop.  v1 acquire pairs with the writer's even release,
-        // ensuring all payload stores are visible once we see a stable version.
-        // The explicit acquire fence before re-reading v2 prevents the compiler
-        // or CPU from hoisting payload loads past the v2 check (ARMv8 plain
-        // loads can otherwise be observed after a later LDAR instruction).
-        // local_seq guards against ring wrap: a version-stable slot may still
-        // carry a newer sequence than expected.
+    for (int i = 0; i < count; ++i) {
+        uint64_t pos = start + static_cast<uint64_t>(i);
+        const Slot& slot = ring.slots[pos & (kRingCapacity - 1)];
+        uint64_t want = stable_seq_for(pos);  // expected even witness for `pos`
         bool retried = false;
+
         for (;;) {
-            uint64_t v1 = slot.version.load(std::memory_order_acquire);
-            if ((v1 & 1u) != 0) {
-                MDSYS_CPU_RELAX();
+            uint64_t s1 = slot.seq.load(std::memory_order_acquire);
+            if (s1 != want) {
+                // Odd  -> a writer is mid-update; spin and retry.
+                // Even -> the slot now holds a different (newer) record, i.e.
+                //         the ring wrapped past the position we wanted.
+                if ((s1 & 1u) == 0) {
+                    if (stats) ++stats->overwrites;
+                    return kErrOverwritten;
+                }
+                MDSYS_RELAX();
                 retried = true;
                 continue;
             }
-
-            uint64_t local_seq = slot.local_seq;
-            MDUniOrder order = slot.order;
-
-            // Fence: ensure payload loads complete before v2 is read.
-            // On ARM this emits dmb ld; on x86 it is a no-op (TSO).
+            MDUniOrder copy = slot.order;
+            // Pair the payload load with the witness recheck: on weak memory
+            // models the acquire fence stops the load from sinking past the
+            // second read. On x86 (TSO) the fence is a no-op.
             std::atomic_thread_fence(std::memory_order_acquire);
-            uint64_t v2 = slot.version.load(std::memory_order_relaxed);
-
-            if (v1 == v2 && (v2 & 1u) == 0) {
-                if (local_seq != expected_seq) {
-                    if (stats != nullptr) {
-                        ++stats->overwrites_detected;
-                    }
-                    return kErrOverwriteDetected;
-                }
-                out_buf[i] = order;
+            uint64_t s2 = slot.seq.load(std::memory_order_relaxed);
+            if (s1 == s2) {
+                out[i] = copy;
                 break;
             }
-            MDSYS_CPU_RELAX();
+            MDSYS_RELAX();
             retried = true;
         }
-        if (retried && stats != nullptr) {
-            ++stats->seqlock_retries;
-        }
+        if (retried && stats) ++stats->retries;
     }
 
-    // A writer can wrap the ring while the reader is copying. Detect that after
-    // the copy and force callers to retry instead of returning mixed epochs.
-    uint64_t write_seq_after = ring.header.write_seq.load(std::memory_order_acquire);
-    if (write_seq_after - start_seq > static_cast<uint64_t>(kRingCapacity)) {
-        if (stats != nullptr) {
-            ++stats->overwrites_detected;
-        }
-        return kErrOverwriteDetected;
+    // Final wrap guard: a writer can lap the reader during the copy loop.
+    uint64_t after = ring.head.write_seq.load(std::memory_order_acquire);
+    if (after - start > static_cast<uint64_t>(kRingCapacity)) {
+        if (stats) ++stats->overwrites;
+        return kErrOverwritten;
     }
-
-    *out_count = actual;
-    return kOk;
+    return count;
 }
 
 }  // namespace mdsys

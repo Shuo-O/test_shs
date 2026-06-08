@@ -20,7 +20,8 @@ import sys
 
 
 RECORD_SIZE = 64
-# Must match C++ TickRecord: uint64 global_seq, uint64 recv_ns, then the
+# Must match C++ LogRecord: uint64 global_seq, uint64 recv_ticks (raw fast
+# clock; convert to wall-clock ns offline via the superblock anchor), then the
 # 40-byte MDUniOrder payload, then uint32 crc32 and uint32 flags.
 ORDER_STRUCT = struct.Struct("<bbb x h xx iiiiii II")
 DEFAULT_BUCKETS = 16
@@ -43,16 +44,16 @@ def parse_wal_file(path: pathlib.Path):
 
     for offset in range(0, len(data), RECORD_SIZE):
         record = data[offset : offset + RECORD_SIZE]
-        global_seq, recv_ns = struct.unpack_from("<QQ", record, 0)
+        global_seq, recv_ticks = struct.unpack_from("<QQ", record, 0)
         order = ORDER_STRUCT.unpack_from(record, 16)
         crc32, flags = struct.unpack_from("<II", record, 56)
-        yield (global_seq, recv_ns, *order, crc32, flags)
+        yield (global_seq, recv_ticks, *order, crc32, flags)
 
 
 def rows_to_table(pa, rows):
     columns = [
         "global_seq",
-        "recv_ns",
+        "recv_ticks",
         "type",
         "bs_flag",
         "tick_type",
