@@ -82,12 +82,12 @@ void StorageTailer::run() {
 
             if ((rec.flags & kFlagInWindow) != 0) {
                 buffer_.push_back(rec);
-                if (buffer_.size() >= 4096) {
-                    flush_buffer();
-                }
             }
             ++next_read_seq_;
             ctx_->ctrl->status.written_wal_seq.store(next_read_seq_, std::memory_order_release);
+            if (buffer_.size() >= 4096) {
+                flush_buffer();
+            }
         }
     }
 }

@@ -89,6 +89,8 @@ void test_latest_n_and_wal() {
 
     uint64_t wal_rows = count_wal_records(wal_dir);
     assert(wal_rows == expected_in_window);
+    assert(md.context()->ctrl->status.durable_wal_seq.load() ==
+           1500 + static_cast<uint64_t>(mdsys::kRingCapacity) + 6);
 
     reader.close();
     mdsys::ShmManager::unlink_all();

@@ -1,5 +1,6 @@
 tick_mock
 tick_tests
+tick_bench
 *.o
 *.dSYM/
 .venv/
@@ -7,6 +8,8 @@ tick_tests
 test_wal/
 wal/
 parquet_out/
+bench_wal/
+bench_parquet*/
 
 __pycache__/
 *.pyc
