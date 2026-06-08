@@ -6,6 +6,17 @@
 #include <atomic>
 #include <cstdint>
 
+// Portable spin-wait hint: reduces pipeline pressure and cache-line bouncing
+// during seqlock retries.  On x86 this emits PAUSE; on ARM it emits YIELD.
+#if defined(__x86_64__) || defined(__i386__)
+#  define MDSYS_CPU_RELAX() __asm__ __volatile__("pause" ::: "memory")
+#elif defined(__aarch64__) || defined(__arm__)
+#  define MDSYS_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+#  include <thread>
+#  define MDSYS_CPU_RELAX() std::this_thread::yield()
+#endif
+
 namespace mdsys {
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free,
@@ -38,16 +49,17 @@ struct alignas(64) ShmHeader {
 
 // Runtime counters intentionally live in shared memory so external processes
 // can monitor ingestion, persistence, and reader health without RPC.
+// committed_seq is NOT duplicated here; read it from ShmHeader::committed_seq.
 struct alignas(64) RuntimeStatus {
-    std::atomic<uint64_t> committed_global_seq;
-    std::atomic<uint64_t> written_wal_seq;
-    std::atomic<uint64_t> durable_wal_seq;
+    std::atomic<uint64_t> durable_wal_seq;          // last seq flushed to disk
     std::atomic<uint64_t> total_ticks_received;
     std::atomic<uint64_t> total_ticks_in_window;
-    std::atomic<uint64_t> reader_retry_count;
-    std::atomic<uint64_t> ring_overwrite_count;
-    std::atomic<uint64_t> daylog_overwrite_count;
+    std::atomic<uint64_t> reader_retry_count;       // seqlock retries by readers
+    std::atomic<uint64_t> ring_overwrite_count;     // reader-detected overwrites
+    std::atomic<uint64_t> daylog_overwrite_count;   // daylog circular overwrite
+    uint64_t              _pad[2];                  // keep struct = 64 B
 };
+static_assert(sizeof(RuntimeStatus) == 64, "RuntimeStatus must be one cache line");
 
 struct ControlSegment {
     ShmHeader header;

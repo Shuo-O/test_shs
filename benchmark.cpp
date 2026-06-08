@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
     double drain_ms = static_cast<double>(to_ns(stop_end - stop_begin)) / 1'000'000.0;
 
     uint64_t wal_rows = count_wal_records(options.wal_dir);
-    uint64_t committed = md.context()->ctrl->status.committed_global_seq.load();
+    uint64_t committed = md.context()->ctrl->header.committed_seq.load();
     uint64_t durable = md.context()->ctrl->status.durable_wal_seq.load();
 
     std::cout << "BENCHMARK_RESULT\n";

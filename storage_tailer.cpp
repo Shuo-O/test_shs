@@ -87,11 +87,14 @@ void StorageTailer::run() {
                 buffer_.push_back(rec);
             }
             ++next_read_seq_;
-            ctx_->ctrl->status.written_wal_seq.store(next_read_seq_, std::memory_order_release);
+            // written_wal_seq is a monitoring counter; update once per batch
+            // rather than on every tick to avoid a per-tick atomic store here.
             if (buffer_.size() >= 4096) {
                 flush_buffer();
             }
         }
+        // Publish how far the tailer has read after draining this batch.
+        ctx_->ctrl->status.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
     }
 }
 

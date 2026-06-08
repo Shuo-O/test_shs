@@ -92,18 +92,24 @@ void DemoMd::on_md(const MDUniOrder& order) {
     mdsys::TickSlot& slot = ring.slots[local_seq & (mdsys::kRingCapacity - 1)];
     uint64_t completed_version = (local_seq + 1) << 1;
 
-    // Seqlock publication: odd version marks an in-progress write; the final
-    // even version makes the slot visible to readers.
-    slot.version.store(completed_version | 1u, std::memory_order_release);
+    // Seqlock publication. The odd store uses relaxed because the release fence
+    // below is what prevents the compiler/CPU from sinking payload stores to
+    // before the odd marker — a plain release store only orders *prior* stores,
+    // not *subsequent* ones (ARMv8 STLR semantics). The final even store is a
+    // release that pairs with the reader's acquire load, ensuring the full
+    // payload is visible before the stable version is seen.
+    slot.version.store(completed_version | 1u, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);  // payload stores stay after odd marker
     slot.local_seq = local_seq;
     slot.global_seq = seq;
     slot.order = order;
     slot.version.store(completed_version, std::memory_order_release);
     ring.header.write_seq.store(local_seq + 1, std::memory_order_release);
 
-    ctx->ctrl->header.writer_heartbeat.store(heartbeat, std::memory_order_release);
+    // committed_seq is the canonical progress counter for both the tailer and
+    // strategy readers; do not duplicate it into RuntimeStatus.
     ctx->ctrl->header.committed_seq.store(seq + 1, std::memory_order_release);
-    ctx->ctrl->status.committed_global_seq.store(seq + 1, std::memory_order_release);
+    ctx->ctrl->header.writer_heartbeat.store(heartbeat, std::memory_order_release);
     ctx->ctrl->status.total_ticks_received.fetch_add(1, std::memory_order_relaxed);
     if (in_window) {
         ctx->ctrl->status.total_ticks_in_window.fetch_add(1, std::memory_order_relaxed);

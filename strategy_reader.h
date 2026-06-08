@@ -39,17 +39,29 @@ inline int query_latest_n(const ShmContext* ctx,
         uint64_t expected_seq = start_seq + static_cast<uint64_t>(i);
         TickSlot& slot = ring.slots[expected_seq & (kRingCapacity - 1)];
 
-        // Retry until the seqlock shows a stable copy. local_seq protects
-        // against ring wrap: a stable slot may still be newer than expected.
+        // Seqlock read loop.  v1 acquire pairs with the writer's even release,
+        // ensuring all payload stores are visible once we see a stable version.
+        // The explicit acquire fence before re-reading v2 prevents the compiler
+        // or CPU from hoisting payload loads past the v2 check (ARMv8 plain
+        // loads can otherwise be observed after a later LDAR instruction).
+        // local_seq guards against ring wrap: a version-stable slot may still
+        // carry a newer sequence than expected.
+        bool retried = false;
         for (;;) {
             uint64_t v1 = slot.version.load(std::memory_order_acquire);
             if ((v1 & 1u) != 0) {
+                MDSYS_CPU_RELAX();
+                retried = true;
                 continue;
             }
 
             uint64_t local_seq = slot.local_seq;
             MDUniOrder order = slot.order;
-            uint64_t v2 = slot.version.load(std::memory_order_acquire);
+
+            // Fence: ensure payload loads complete before v2 is read.
+            // On ARM this emits dmb ld; on x86 it is a no-op (TSO).
+            std::atomic_thread_fence(std::memory_order_acquire);
+            uint64_t v2 = slot.version.load(std::memory_order_relaxed);
 
             if (v1 == v2 && (v2 & 1u) == 0) {
                 if (local_seq != expected_seq) {
@@ -58,7 +70,11 @@ inline int query_latest_n(const ShmContext* ctx,
                 out_buf[i] = order;
                 break;
             }
-
+            MDSYS_CPU_RELAX();
+            retried = true;
+        }
+        if (retried) {
+            ctx->ctrl->status.reader_retry_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
