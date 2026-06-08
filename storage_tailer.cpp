@@ -135,8 +135,8 @@ bool StorageTailer::flush_buffer() {
         last_error_ = errno_text("fsync");
         return false;
     }
-    // In this DEV_MOCK implementation durable means fsync completed for the
-    // buffered WAL batch. A production O_DIRECT path would track this separately.
+    // durable means fsync completed for the buffered WAL batch. An O_DIRECT
+    // deployment can keep the same sequence semantics with a different IO path.
     ctx_->ctrl->status.tailer.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
     buffer_.clear();
     return true;
