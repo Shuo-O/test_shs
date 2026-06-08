@@ -153,6 +153,8 @@ int main(int argc, char** argv) {
     }
 
     for (int i = 0; i < options.symbols; ++i) {
+        // Warm up instrument registration outside the persistence window so
+        // measured rows only reflect the steady on_md path.
         md.on_md(make_order(600000 + i, i, 80000));
     }
 
@@ -182,6 +184,8 @@ int main(int argc, char** argv) {
     }
 
     Stats query_100 = benchmark_query(reader.context(), 600000, 100, options.query_iters);
+    // latest-1000 copies 40KB per call, so fewer iterations keep the benchmark
+    // quick while still enough to expose p99 behavior.
     Stats query_1000 = benchmark_query(reader.context(), 600000, 1000, options.query_iters / 5);
 
     auto stop_begin = Clock::now();

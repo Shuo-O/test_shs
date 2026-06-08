@@ -20,6 +20,8 @@ import sys
 
 
 RECORD_SIZE = 64
+# Must match C++ TickRecord: uint64 global_seq, uint64 recv_ns, then the
+# 40-byte MDUniOrder payload, then uint32 crc32 and uint32 flags.
 ORDER_STRUCT = struct.Struct("<bbb x h xx iiiiii II")
 DEFAULT_BUCKETS = 16
 DEFAULT_ROW_GROUP_ROWS = 1_000_000
@@ -110,6 +112,8 @@ def main(argv: list[str]) -> int:
     for wal_file in sorted(args.wal_dir.glob("*.bin")):
         for row in parse_wal_file(wal_file):
             instrument_id = row[6]
+            # Buffer per bucket across WAL segments so production-sized runs do
+            # not produce tiny Parquet row groups.
             bucket = instrument_id % args.buckets
             bucket_rows = buffers[bucket]
             bucket_rows.append(row)

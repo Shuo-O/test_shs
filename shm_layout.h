@@ -12,6 +12,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free,
               "shared-memory uint64 atomics must be lock-free");
 static_assert(sizeof(MDUniOrder) == 40, "MDUniOrder ABI changed");
 
+// Negative values are reserved for reader-facing API errors.
 enum MdError {
     kOk = 0,
     kErrUnknownInstrument = -1,
@@ -21,6 +22,8 @@ enum MdError {
     kErrNoCapacity = -5,
 };
 
+// Control metadata is mapped by both writer and readers. committed_seq is an
+// exclusive end: records in [0, committed_seq) have been published.
 struct alignas(64) ShmHeader {
     uint64_t magic;
     uint32_t abi_version;
@@ -33,6 +36,8 @@ struct alignas(64) ShmHeader {
     uint8_t _pad[16];
 };
 
+// Runtime counters intentionally live in shared memory so external processes
+// can monitor ingestion, persistence, and reader health without RPC.
 struct alignas(64) RuntimeStatus {
     std::atomic<uint64_t> committed_global_seq;
     std::atomic<uint64_t> written_wal_seq;
@@ -46,10 +51,14 @@ struct alignas(64) RuntimeStatus {
 
 struct ControlSegment {
     ShmHeader header;
+    // Direct indexing avoids hash-table branches and pointer chasing in the
+    // hot path. Invalid instruments map to kInvalidInstrumentIndex.
     int32_t instrument_to_index[kIdArraySize];
     RuntimeStatus status;
 };
 
+// One cache-line slot in a per-symbol ring. version is a seqlock:
+// odd means a writer is updating the slot, even means the payload is stable.
 struct alignas(64) TickSlot {
     std::atomic<uint64_t> version;  // odd while writer is updating, even when stable
     uint64_t local_seq;
@@ -59,6 +68,8 @@ struct alignas(64) TickSlot {
 
 static_assert(sizeof(TickSlot) == 64, "TickSlot must stay one cache line");
 
+// write_seq is also an exclusive end for this symbol. The latest record is
+// write_seq - 1 when write_seq > 0.
 struct alignas(64) PerSymbolRingHeader {
     std::atomic<uint64_t> write_seq;  // exclusive end for this symbol
     uint32_t symbol_id;
@@ -74,6 +85,8 @@ struct RingSegment {
     PerSymbolRing rings[kInstrumentCount];
 };
 
+// Append-only global stream used by the storage tailer. The array is circular,
+// so consumers must verify global_seq before trusting a slot.
 struct alignas(64) TickRecord {
     uint64_t global_seq;
     uint64_t recv_ns;
@@ -88,6 +101,7 @@ struct DayLogSegment {
     TickRecord records[kLogCapacity];
 };
 
+// The demo assumes recvTime is hhmmss-style integer time.
 inline bool is_in_trading_window(int32_t recv_time) {
     return recv_time >= 92500 && recv_time <= 150000;
 }

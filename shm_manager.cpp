@@ -37,6 +37,8 @@ bool ShmManager::create(bool reset_existing, uint32_t trading_day) {
         unlink_all();
     }
 
+    // The segments are split so readers can map only control+rings and avoid
+    // mapping the large day log used by storage.
     if (!map_segment(kCtrlShmName, ctrl_size_, true, false,
                      reinterpret_cast<void**>(&ctx_.ctrl))) {
         close();
@@ -148,6 +150,7 @@ bool ShmManager::map_segment(const char* name,
 
 bool ShmManager::initialize(uint32_t trading_day) {
     std::memset(ctx_.ctrl, 0, ctrl_size_);
+    // Fill the whole direct index before publishing the header.
     for (int32_t i = 0; i < kIdArraySize; ++i) {
         ctx_.ctrl->instrument_to_index[i] = kInvalidInstrumentIndex;
     }

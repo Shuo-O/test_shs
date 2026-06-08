@@ -71,11 +71,15 @@ void DemoMd::on_md(const MDUniOrder& order) {
     uint64_t heartbeat = now_ns();
     bool in_window = mdsys::is_in_trading_window(order.recvTime);
 
+    // If the tailer falls a full log behind, the circular day log may overwrite
+    // data that has not been durably written yet. Production should fail closed.
     if (seq - ctx->ctrl->status.durable_wal_seq.load(std::memory_order_relaxed) >=
         mdsys::kLogCapacity) {
         ctx->ctrl->status.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // GlobalDayLog is the ordered full-market stream. Storage consumes it by
+    // global sequence; strategies read latest-n from the per-symbol rings below.
     mdsys::TickRecord& record = ctx->daylog->records[seq % mdsys::kLogCapacity];
     record.global_seq = seq;
     record.recv_ns = heartbeat;
@@ -87,6 +91,9 @@ void DemoMd::on_md(const MDUniOrder& order) {
     uint64_t local_seq = ring.header.write_seq.load(std::memory_order_relaxed);
     mdsys::TickSlot& slot = ring.slots[local_seq & (mdsys::kRingCapacity - 1)];
     uint64_t completed_version = (local_seq + 1) << 1;
+
+    // Seqlock publication: odd version marks an in-progress write; the final
+    // even version makes the slot visible to readers.
     slot.version.store(completed_version | 1u, std::memory_order_release);
     slot.local_seq = local_seq;
     slot.global_seq = seq;
@@ -120,6 +127,8 @@ int32_t DemoMd::get_or_register_instrument(int32_t instrument_id) {
     int32_t assigned = next_symbol_index_++;
     ctx->rings->rings[assigned].header.symbol_id = static_cast<uint32_t>(instrument_id);
     ctx->rings->rings[assigned].header.write_seq.store(0, std::memory_order_relaxed);
+    // Single writer today, so no CAS is needed. A multi-feed production build
+    // must protect this registration path during startup.
     ctx->ctrl->instrument_to_index[instrument_id] = assigned;
     ctx->ctrl->header.instrument_count = static_cast<uint32_t>(next_symbol_index_);
     return assigned;

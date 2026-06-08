@@ -39,6 +39,8 @@ inline int query_latest_n(const ShmContext* ctx,
         uint64_t expected_seq = start_seq + static_cast<uint64_t>(i);
         TickSlot& slot = ring.slots[expected_seq & (kRingCapacity - 1)];
 
+        // Retry until the seqlock shows a stable copy. local_seq protects
+        // against ring wrap: a stable slot may still be newer than expected.
         for (;;) {
             uint64_t v1 = slot.version.load(std::memory_order_acquire);
             if ((v1 & 1u) != 0) {
@@ -60,6 +62,8 @@ inline int query_latest_n(const ShmContext* ctx,
         }
     }
 
+    // A writer can wrap the ring while the reader is copying. Detect that after
+    // the copy and force callers to retry instead of returning mixed epochs.
     uint64_t write_seq_after = ring.header.write_seq.load(std::memory_order_acquire);
     if (write_seq_after - start_seq > static_cast<uint64_t>(kRingCapacity)) {
         return kErrOverwriteDetected;

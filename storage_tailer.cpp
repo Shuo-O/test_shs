@@ -61,6 +61,8 @@ void StorageTailer::stop() {
 void StorageTailer::run() {
     while (running_.load(std::memory_order_acquire) ||
            next_read_seq_ < ctx_->ctrl->header.committed_seq.load(std::memory_order_acquire)) {
+        // committed_seq is an exclusive end. The tailer owns [next_read_seq_,
+        // committed) and never blocks the writer.
         uint64_t committed = ctx_->ctrl->header.committed_seq.load(std::memory_order_acquire);
         if (next_read_seq_ >= committed) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -74,6 +76,7 @@ void StorageTailer::run() {
 
         while (next_read_seq_ < committed) {
             TickRecord& rec = ctx_->daylog->records[next_read_seq_ % kLogCapacity];
+            // Verify the circular slot has not already been overwritten.
             if (rec.global_seq != next_read_seq_) {
                 ctx_->ctrl->status.daylog_overwrite_count.fetch_add(1, std::memory_order_relaxed);
                 ++next_read_seq_;
@@ -124,6 +127,8 @@ bool StorageTailer::flush_buffer() {
         last_error_ = errno_text("fsync");
         return false;
     }
+    // In this DEV_MOCK implementation durable means fsync completed for the
+    // buffered WAL batch. A production O_DIRECT path would track this separately.
     ctx_->ctrl->status.durable_wal_seq.store(next_read_seq_, std::memory_order_release);
     buffer_.clear();
     return true;
