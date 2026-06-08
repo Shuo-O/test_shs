@@ -2,6 +2,7 @@ tick_mock
 tick_tests
 *.o
 *.dSYM/
+.venv/
 
 test_wal/
 wal/

@@ -3,6 +3,7 @@
 #include "strategy_reader.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <vector>
@@ -37,6 +38,7 @@ uint64_t count_wal_records(const std::filesystem::path& dir) {
 
 void test_latest_n_and_wal() {
     const std::filesystem::path wal_dir = "test_wal";
+    const bool keep_wal = std::getenv("KEEP_TEST_WAL") != nullptr;
     std::filesystem::remove_all(wal_dir);
     mdsys::ShmManager::unlink_all();
 
@@ -90,7 +92,9 @@ void test_latest_n_and_wal() {
 
     reader.close();
     mdsys::ShmManager::unlink_all();
-    std::filesystem::remove_all(wal_dir);
+    if (!keep_wal) {
+        std::filesystem::remove_all(wal_dir);
+    }
 }
 
 }  // namespace

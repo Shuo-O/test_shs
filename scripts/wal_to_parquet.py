@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert DEV_MOCK WAL files to Parquet with pyarrow.
+"""Convert WAL files to bucketed Parquet with pyarrow.
 
 This converter is intentionally outside the C++ hot path. It requires:
 
@@ -7,11 +7,13 @@ This converter is intentionally outside the C++ hot path. It requires:
 
 Usage:
 
-    scripts/wal_to_parquet.py wal_dir out_dir
+    scripts/wal_to_parquet.py wal_dir out_dir --trading-day 20260608
 """
 
 from __future__ import annotations
 
+import argparse
+import collections
 import pathlib
 import struct
 import sys
@@ -19,6 +21,8 @@ import sys
 
 RECORD_SIZE = 64
 ORDER_STRUCT = struct.Struct("<bbb x h xx iiiiii II")
+DEFAULT_BUCKETS = 16
+DEFAULT_ROW_GROUP_ROWS = 1_000_000
 
 
 def load_pyarrow():
@@ -31,7 +35,6 @@ def load_pyarrow():
 
 
 def parse_wal_file(path: pathlib.Path):
-    rows = []
     data = path.read_bytes()
     if len(data) % RECORD_SIZE != 0:
         raise ValueError(f"{path} size is not a multiple of {RECORD_SIZE}")
@@ -41,20 +44,10 @@ def parse_wal_file(path: pathlib.Path):
         global_seq, recv_ns = struct.unpack_from("<QQ", record, 0)
         order = ORDER_STRUCT.unpack_from(record, 16)
         crc32, flags = struct.unpack_from("<II", record, 56)
-        rows.append((global_seq, recv_ns, *order, crc32, flags))
-    return rows
+        yield (global_seq, recv_ns, *order, crc32, flags)
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: wal_to_parquet.py wal_dir out_dir", file=sys.stderr)
-        return 2
-
-    pa, pq = load_pyarrow()
-    wal_dir = pathlib.Path(argv[1])
-    out_dir = pathlib.Path(argv[2])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+def rows_to_table(pa, rows):
     columns = [
         "global_seq",
         "recv_ns",
@@ -74,18 +67,77 @@ def main(argv: list[str]) -> int:
         "flags",
     ]
 
-    all_rows = []
-    for wal_file in sorted(wal_dir.glob("*.bin")):
-        all_rows.extend(parse_wal_file(wal_file))
+    if not rows:
+        return pa.table({name: [] for name in columns})
+    arrays = list(zip(*rows))
+    return pa.table({name: values for name, values in zip(columns, arrays)})
 
-    if not all_rows:
-        table = pa.table({name: [] for name in columns})
-    else:
-        arrays = list(zip(*all_rows))
-        table = pa.table({name: values for name, values in zip(columns, arrays)})
 
-    pq.write_table(table, out_dir / "ticks.parquet", compression="lz4")
-    print(f"wrote {table.num_rows} rows to {out_dir / 'ticks.parquet'}")
+def write_bucket(pa, pq, rows, out_dir: pathlib.Path, trading_day: str, bucket: int, part: int) -> int:
+    if not rows:
+        return 0
+    bucket_dir = out_dir / f"date={trading_day}" / f"bucket={bucket:02d}"
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+    table = rows_to_table(pa, rows)
+    pq.write_table(
+        table,
+        bucket_dir / f"part-{part:06d}.parquet",
+        compression="lz4",
+        use_dictionary=["instrument_id", "channel"],
+    )
+    return table.num_rows
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("wal_dir", type=pathlib.Path)
+    parser.add_argument("out_dir", type=pathlib.Path)
+    parser.add_argument("--trading-day", default="unknown")
+    parser.add_argument("--buckets", type=int, default=DEFAULT_BUCKETS)
+    parser.add_argument("--row-group-rows", type=int, default=DEFAULT_ROW_GROUP_ROWS)
+    return parser.parse_args(argv[1:])
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    pa, pq = load_pyarrow()
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    buffers = collections.defaultdict(list)
+    part_index = collections.defaultdict(int)
+    total_rows = 0
+
+    for wal_file in sorted(args.wal_dir.glob("*.bin")):
+        for row in parse_wal_file(wal_file):
+            instrument_id = row[6]
+            bucket = instrument_id % args.buckets
+            bucket_rows = buffers[bucket]
+            bucket_rows.append(row)
+            if len(bucket_rows) >= args.row_group_rows:
+                total_rows += write_bucket(
+                    pa,
+                    pq,
+                    bucket_rows,
+                    args.out_dir,
+                    str(args.trading_day),
+                    bucket,
+                    part_index[bucket],
+                )
+                part_index[bucket] += 1
+                buffers[bucket] = []
+
+    for bucket in sorted(buffers):
+        total_rows += write_bucket(
+            pa,
+            pq,
+            buffers[bucket],
+            args.out_dir,
+            str(args.trading_day),
+            bucket,
+            part_index[bucket],
+        )
+
+    print(f"wrote {total_rows} rows to {args.out_dir}")
     return 0
 
 
