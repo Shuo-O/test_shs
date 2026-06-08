@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <cstdint>
 
 #ifdef _MSC_VER
 #undef max

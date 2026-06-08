@@ -1,0 +1,11 @@
+tick_mock
+tick_tests
+*.o
+*.dSYM/
+
+test_wal/
+wal/
+parquet_out/
+
+__pycache__/
+*.pyc
