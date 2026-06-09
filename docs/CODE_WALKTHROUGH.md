@@ -151,7 +151,14 @@ v2 = version
 再检查 slot.local_seq == expected_seq，防止 ring wrap 后读到新 epoch
 ```
 
-`query_latest_n` 最后还会重新读取 `write_seq`，检查复制过程中是否发生覆盖。
+`query_latest_n` **不需要**在结尾重新读取 `write_seq`：偶数见证值编码了槽的位置，
+每个被接受的槽都在拷贝前后验证过 `version == 2*(seq+1)`，覆盖在槽级自暴露
+（见证值变大 → `kErrOverwritten`）。因此整组结果等价于起始 `write_seq` 快照
+时刻的环内容；写者在拷贝期间绕环只会让快照"稍旧"，不会让它不一致。早期版本
+在结尾复查 `write_seq`，会在写压下误杀一致快照（深查询 n≈capacity 时写者只需
+推进 capacity−n 个位置即触发），并且每次查询多拉一次写者热点 cache line。
+另外 n==1（最常见的"最新一条"轮询）走单槽快路径：一次 acquire + 一次 fence，
+跳过分块批量机制。
 
 ## WAL 路径
 

@@ -3,6 +3,7 @@
 #include "strategy_reader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -137,6 +139,54 @@ Stats benchmark_query(const mdsys::Mapping& mapping,
     return summarize(std::move(samples));
 }
 
+struct LiveStats {
+    Stats stats;
+    uint64_t successes = 0;
+    uint64_t aborts = 0;
+};
+
+// Query while a producer is concurrently writing the same symbol's ring.
+// kErrOverwritten is not a failure here -- the ring genuinely wrapped under the
+// reader -- so count it and sample only successful snapshots.
+LiveStats benchmark_query_live(const mdsys::Mapping& mapping,
+                               int32_t instrument_id,
+                               int n,
+                               int iterations) {
+    std::vector<MDUniOrder> out(static_cast<size_t>(n));
+    std::vector<uint64_t> samples;
+    samples.reserve(static_cast<size_t>(iterations));
+    LiveStats live;
+    long attempts_cap = static_cast<long>(iterations) * 100;
+    for (long attempt = 0;
+         static_cast<int>(samples.size()) < iterations && attempt < attempts_cap;
+         ++attempt) {
+        auto start = Clock::now();
+        int count = mdsys::query_latest_n(mapping, instrument_id, n, out.data());
+        auto end = Clock::now();
+        if (count == mdsys::kErrOverwritten) {
+            ++live.aborts;
+            continue;
+        }
+        if (count <= 0) {
+            std::cerr << "live query_latest_n failed, count=" << count << "\n";
+            std::exit(1);
+        }
+        ++live.successes;
+        samples.push_back(to_ns(end - start));
+    }
+    live.stats = summarize(std::move(samples));
+    return live;
+}
+
+void print_live(const std::string& name, const LiveStats& live) {
+    print_stats(name, live.stats);
+    double total = static_cast<double>(live.successes + live.aborts);
+    std::cout << "  " << name << " successes=" << live.successes
+              << " aborts=" << live.aborts << " abort_rate="
+              << (total > 0 ? 100.0 * static_cast<double>(live.aborts) / total : 0.0)
+              << "%\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -187,6 +237,33 @@ int main(int argc, char** argv) {
     // quick while still enough to expose p99 behavior.
     Stats query_1000 = benchmark_query(reader.mapping(), 600000, 1000, options.query_iters / 5);
 
+    // Contended phase: a live writer hammers one symbol's ring while the reader
+    // queries it. Live ticks are out-of-window (recvTime 80000) so the WAL row
+    // accounting below is untouched and only the ring/reader path is exercised.
+    // The writer self-limits to half the day log so the durable-lag soft guard
+    // stays quiet even if the queries take unusually long.
+    LiveStats live_100;
+    LiveStats live_1000;
+    uint64_t live_ticks = 0;
+    {
+        std::atomic<bool> live_stop{false};
+        std::thread live_writer([&] {
+            uint64_t budget = mdsys::kLogCapacity / 2;
+            int32_t seq = 0;
+            while (!live_stop.load(std::memory_order_acquire) && budget > 0) {
+                md.on_md(make_order(600000, seq++, 80000));
+                --budget;
+            }
+            live_ticks = mdsys::kLogCapacity / 2 - budget;
+        });
+        live_100 = benchmark_query_live(reader.mapping(), 600000, 100,
+                                        options.query_iters / 25);
+        live_1000 = benchmark_query_live(reader.mapping(), 600000, 1000,
+                                         options.query_iters / 50);
+        live_stop.store(true, std::memory_order_release);
+        live_writer.join();
+    }
+
     auto stop_begin = Clock::now();
     md.stop();
     auto stop_end = Clock::now();
@@ -204,6 +281,9 @@ int main(int argc, char** argv) {
     print_stats("on_md", ingest_stats);
     print_stats("query_latest_n(100)", query_100);
     print_stats("query_latest_n(1000)", query_1000);
+    print_live("live query_latest_n(100)", live_100);
+    print_live("live query_latest_n(1000)", live_1000);
+    std::cout << "live_writer_ticks=" << live_ticks << "\n";
     std::cout << "tailer_drain_ms=" << drain_ms << "\n";
     std::cout << "wal_rows=" << wal_rows << "\n";
     std::cout << "committed_seq=" << committed << "\n";

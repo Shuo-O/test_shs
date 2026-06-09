@@ -289,12 +289,14 @@ int query_latest_n(const ShmContext* ctx,
      seq = start_seq + i
      slot_idx = seq & (ring_capacity - 1)
      seqlock_read(ring->slots[slot_idx], &out_buf[i])
+     // overwrite 检测内建于 seqlock_read：偶数见证值编码位置，
+     // 槽被新一轮数据覆盖时 witness != 2*(seq+1) → return ERR_OVERWRITE
 
-5. // overwrite 检测：读完后再次检查
-   ws2 = ring->header.write_seq.load(acquire)
-   if ws2 - start_seq > ring_capacity → return ERR_OVERWRITE
-
-6. return actual_n
+5. return actual_n
+   // 每个槽都在拷贝前后验证过身份见证，结果等价于第 2 步 write_seq 快照
+   // 时刻的环内容，无需读完后再复查 write_seq——那种复查会在写压下误杀
+   // 一致快照（actual_n 接近 ring_capacity 时写者只需推进
+   // ring_capacity - actual_n 个位置即触发），且多读一次写者热点行。
 ```
 
 ### 查询延迟估算（L1 量化基准 @3.5 GHz）
