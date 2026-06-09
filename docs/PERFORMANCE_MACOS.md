@@ -1,11 +1,12 @@
 # macOS Performance Report
 
-Measured on the local Mac for branch `functional-core-dev`.
+Measured on the local Mac for `main` / `functional-core-dev` after the batched
+seqlock query optimization.
 
 ## Environment
 
 ```text
-Date: 2026-06-09
+Date: 2026-06-10
 OS: macOS 26.5, build 25F71
 CPU: Apple M3 Pro
 Cores reported by hw.ncpu: 11
@@ -60,28 +61,28 @@ ticks.
 ```text
 rows=500000
 symbols=128
-ingest_seconds=0.023421
-ingest_throughput_ticks_per_sec=2.13484e+07
+ingest_seconds=0.0209705
+ingest_throughput_ticks_per_sec=2.38431e+07
 committed_seq=500000
 durable_seq=500000
-tailer_drain_ms=0.110125
+tailer_drain_ms=0.101542
 ```
 
 `on_md` latency:
 
 ```text
 p50:   0 ns
-p99:   125 ns
-p999:  1,416 ns
-max:   155,333 ns
+p99:   84 ns
+p999:  958 ns
+max:   48,958 ns
 ```
 
 Interpretation:
 
 ```text
-Average measured ingest throughput is about 21.35M ticks/s.
-This is about 21.3x above a 1M ticks/s design target.
-This is about 10.7x above a 2M ticks/s burst target.
+Average measured ingest throughput is about 23.84M ticks/s.
+This is about 23.8x above a 1M ticks/s design target.
+This is about 11.9x above a 2M ticks/s burst target.
 The p99 on_md latency is well below 2us.
 The p50=0ns value reflects macOS steady_clock granularity at this scale.
 The max value reflects scheduler/runtime noise and is not a production p9999.
@@ -92,30 +93,29 @@ The max value reflects scheduler/runtime noise and is not a production p9999.
 `query_latest_n(100)`:
 
 ```text
-p50:   583 ns
-p99:   1,500 ns
-p999:  5,417 ns
-max:   73,917 ns
+p50:   167 ns
+p99:   208 ns
+p999:  292 ns
+max:   7,125 ns
 ```
 
 `query_latest_n(1000)`:
 
 ```text
-p50:   29,625 ns
-p99:   43,458 ns
-p999:  127,958 ns
-max:   733,667 ns
+p50:   1,584 ns
+p99:   2,084 ns
+p999:  2,250 ns
+max:   8,167 ns
 ```
 
 Interpretation:
 
 ```text
-latest-100 p99 is below 2us on this Mac run.
-latest-1000 copies 40KB of payload and validates 1,000 seqlock slots per call.
-The measured latest-1000 p99 is 43.458us, so this macOS run does not meet a
-20us p99 target for 1,000-record copy-out queries.
-For a strict <20us latest-1000 target, use a Linux tuned host and consider a
-zero-copy/iterator API or a bounded query depth used by the strategy hot path.
+latest-100 p99 is far below 5us.
+latest-1000 p99 is 2.084us, far below the self-imposed 20us L1 benchmark.
+The batched seqlock reader snapshots versions, copies payloads, then rechecks
+versions in tiles, reducing acquire fences from O(n) to O(n/tile) on weak-memory
+CPUs while preserving the per-slot seqlock correctness fallback.
 ```
 
 ## WAL and Parquet Benchmark
@@ -140,15 +140,15 @@ rows verified: 500,000
 Parquet conversion time for 500,000 rows:
 
 ```text
-real: 1.21 s
-user: 1.05 s
-sys:  0.09 s
+real: 0.92 s
+user: 0.85 s
+sys:  0.05 s
 ```
 
 Estimated conversion throughput:
 
 ```text
-500,000 rows / 1.21s ~= 413,000 rows/s
+500,000 rows / 0.92s ~= 543,000 rows/s
 ```
 
 Interpretation:
@@ -168,7 +168,7 @@ Parquet conversion/read-back tests: passed
 on_md throughput target: passed
 on_md p99 target: passed
 latest-100 p99 target: passed
-latest-1000 <20us p99 target on macOS: not passed in this run
+latest-1000 <20us p99 target on macOS: passed
 ```
 
 Recommended production validation:
