@@ -74,12 +74,11 @@ inline int query_latest(const Mapping& m, int32_t symbol, int n,
         if (retried && stats) ++stats->retries;
     }
 
-    // Final wrap guard: a writer can lap the reader during the copy loop.
-    uint64_t after = ring.head.write_seq.load(std::memory_order_acquire);
-    if (after - start > static_cast<uint64_t>(kRingCapacity)) {
-        if (stats) ++stats->overwrites;
-        return kErrOverwritten;
-    }
+    // No trailing write_seq recheck: every accepted slot was identity-checked
+    // (witness == 2*(pos+1)) on both sides of its copy, so the result already
+    // equals the ring content at the initial write_seq snapshot. A writer
+    // lapping positions we copied cannot invalidate them -- it can only make
+    // the snapshot slightly stale, which is true of any snapshot on return.
     return count;
 }
 
