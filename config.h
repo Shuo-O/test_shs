@@ -1,8 +1,8 @@
 #pragma once
 
-// Single production profile for a single-socket high-frequency x86-64 server
-// (see docs/DESIGN_SPEC.md, tier L1/L2). One fixed set of dimensions drives the
-// whole shared-memory ABI -- there is intentionally no mock/dev profile.
+// Single production profile for a single-socket high-frequency server. One fixed
+// set of dimensions drives the whole shared-memory ABI -- there is intentionally
+// no mock/dev profile in this branch.
 //
 //   instruments   : 5,000 A-share securities
 //   ring_capacity : 16,384  (== max query depth, power of two)
