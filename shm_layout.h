@@ -30,6 +30,9 @@ namespace mdsys {
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free,
               "shared uint64 atomics must be lock-free");
+static_assert(std::atomic<int32_t>::is_always_lock_free &&
+              sizeof(std::atomic<int32_t>) == sizeof(int32_t),
+              "shared int32 atomics must be lock-free and layout-compatible");
 static_assert(sizeof(MDUniOrder) == 40, "MDUniOrder ABI changed");
 
 enum QueryError : int {
@@ -41,13 +44,16 @@ enum QueryError : int {
 
 // --- Control region, cache-line partitioned by access pattern --------------
 
-// Line 0: static metadata, written once at init then read-only. Carries the
-// clock anchor used to convert raw recv_ticks to wall-clock ns offline.
+// Line 0: static metadata, written at init (magic is stored release, last, so
+// an attaching process that acquire-loads it sees the rest). Carries the clock
+// anchor used to convert raw recv_ticks to wall-clock ns offline.
+// instrument_count grows as symbols register; the shared scalars are atomic at
+// zero cost -- relaxed u32/u64 ops compile to plain loads/stores.
 struct alignas(64) Superblock {
-    uint64_t magic;
+    std::atomic<uint64_t> magic;
     uint32_t abi_version;
     uint32_t trading_day;        // YYYYMMDD
-    uint32_t instrument_count;   // registered symbols
+    std::atomic<uint32_t> instrument_count;  // registered symbols
     uint32_t ring_capacity;
     uint64_t log_capacity;
     uint64_t epoch_ns_at_start;  // wall-clock anchor (ns)
@@ -94,7 +100,11 @@ struct ControlRegion {
     WriterStats   wstats;
     TailerStats   tstats;
     // Direct id->index map. -1 == unregistered. Sized to the full code space.
-    int32_t       index[kIdSpace];
+    // Atomic so the cross-process read/write is defined behavior: the writer
+    // publishes with release after initializing the ring head; readers load
+    // relaxed -- ring data carries its own release/acquire edges, and a stale
+    // miss just reports the symbol as unknown for one more query.
+    std::atomic<int32_t> index[kIdSpace];
 };
 
 // --- Per-symbol ring (seqlock) ---------------------------------------------
