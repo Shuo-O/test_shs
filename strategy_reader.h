@@ -76,7 +76,9 @@ inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
     if (symbol < 0 || symbol >= kIdSpace) {
         return kErrUnknownSymbol;
     }
-    int32_t idx = m.ctrl->index[symbol];
+    // Relaxed is enough: ring publications carry their own release/acquire
+    // edges, and a stale miss just reports unknown-symbol for one more query.
+    int32_t idx = m.ctrl->index[symbol].load(std::memory_order_relaxed);
     if (idx < 0 || idx >= kInstrumentCount) {
         return kErrUnknownSymbol;
     }
