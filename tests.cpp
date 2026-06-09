@@ -85,6 +85,10 @@ void test_functional() {
     md.stop();  // drains + fsyncs the tailer
 
     assert(count_wal_rows(wal) == expect_in_window);          // requirement B
+    // After a clean drain the cursors converge, even when the tail of the day
+    // log is out-of-window (durable tracks consumption, not just WAL writes).
+    assert(md.mapping()->ctrl->tailer.durable_seq.load() ==
+           md.mapping()->ctrl->writer.committed_seq.load());
     reader.close();
     ShmManager::unlink();
     std::filesystem::remove_all(wal);

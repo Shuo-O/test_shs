@@ -41,8 +41,23 @@ bool StorageTailer::start() {
 void StorageTailer::stop() {
     running_.store(false, std::memory_order_release);
     if (thread_.joinable()) thread_.join();
-    flush();          // final drain
+    // Final drain -- but never after a failed write: the segment may hold a
+    // partial batch, and blindly rewriting the buffer would duplicate rows.
+    if (!failed_) {
+        if (flush()) {
+            publish_durable();  // fully drained: cursors converge
+        } else {
+            failed_ = true;
+        }
+    }
     close_segment();
+}
+
+void StorageTailer::publish_durable() {
+    if (published_durable_ != read_seq_) {
+        m_->ctrl->tailer.durable_seq.store(read_seq_, std::memory_order_release);
+        published_durable_ = read_seq_;
+    }
 }
 
 void StorageTailer::run() {
@@ -52,19 +67,34 @@ void StorageTailer::run() {
     while (running_.load(std::memory_order_acquire) || read_seq_ < committed()) {
         uint64_t end = committed();
         if (read_seq_ >= end) {
-            // Idle: flush a partial tail so durability lag stays bounded at low
-            // volume, then back off briefly.
-            if (!buf_.empty() && !flush()) break;
+            if (!buf_.empty()) {
+                // Idle: flush the partial tail so durability lag stays bounded
+                // at low volume.
+                if (!flush()) { failed_ = true; break; }
+            } else {
+                // Fully drained with nothing buffered: every in-window record
+                // up to read_seq_ is on disk, so keep the durable cursor
+                // honest -- otherwise off-window traffic shows phantom lag.
+                publish_durable();
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             continue;
         }
         while (read_seq_ < end) {
-            LogRecord& rec = m_->log->records[read_seq_ & (kLogCapacity - 1)];
+            const LogRecord& rec = m_->log->records[read_seq_ & (kLogCapacity - 1)];
             // If the circular log already wrapped past this slot, skip it.
             if (rec.global_seq != read_seq_) { ++read_seq_; continue; }
-            if ((rec.flags & kFlagInWindow) != 0) buf_.push_back(rec);
+            LogRecord copy;
+            std::memcpy(&copy, &rec, sizeof copy);
+            // Recheck identity after the copy: if the writer lapped us mid-copy
+            // the slot names a different record now, so drop the torn copy.
+            // A lap is unreachable by design (the log holds ~1.8x a day), but
+            // this keeps the unreachable path from persisting garbage.
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (rec.global_seq != read_seq_) { ++read_seq_; continue; }
+            if ((copy.flags & kFlagInWindow) != 0) buf_.push_back(copy);
             ++read_seq_;
-            if (buf_.size() >= kWalFlushRows && !flush()) return;
+            if (buf_.size() >= kWalFlushRows && !flush()) { failed_ = true; return; }
         }
     }
 }
@@ -88,6 +118,7 @@ bool StorageTailer::flush() {
     if (::fsync(fd_) != 0) { error_ = err("fsync"); return false; }
     // Durable only after fsync: every in-window record up to read_seq_ is on disk.
     m_->ctrl->tailer.durable_seq.store(read_seq_, std::memory_order_release);
+    published_durable_ = read_seq_;
     buf_.clear();
     return true;
 }

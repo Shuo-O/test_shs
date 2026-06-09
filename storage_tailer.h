@@ -26,6 +26,7 @@ public:
 private:
     void run();
     bool flush();          // write+fsync the buffer, then advance durable_seq
+    void publish_durable();
     bool open_segment();
     bool write_all(const void* data, size_t bytes);
     void close_segment();
@@ -40,6 +41,8 @@ private:
     uint64_t read_seq_ = 0;
     uint64_t rows_in_segment_ = 0;
     uint64_t segment_ = 0;
+    uint64_t published_durable_ = 0;
+    bool     failed_ = false;  // a WAL write failed: stop consuming, never retry
 };
 
 }  // namespace mdsys
