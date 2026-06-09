@@ -1,8 +1,8 @@
 #pragma once
 
-// Single production profile for a single-socket high-frequency server. One fixed
-// set of dimensions drives the whole shared-memory ABI -- there is intentionally
-// no mock/dev profile in this branch.
+// Production profile for a single-socket high-frequency server. The dev branch
+// also supports -DDEV_MOCK so tests and benchmarks can run on a laptop without
+// allocating the full 37 GiB production shared-memory footprint.
 //
 //   instruments   : 5,000 A-share securities
 //   ring_capacity : 16,384  (== max query depth, power of two)
@@ -16,10 +16,17 @@
 
 namespace mdsys {
 
+#if defined(DEV_MOCK)
+constexpr int32_t  kInstrumentCount = 256;
+constexpr int32_t  kRingCapacity    = 1'024;           // 2^10
+constexpr uint64_t kLogCapacity     = 1'048'576ULL;    // 2^20
+constexpr int32_t  kWalSegmentRows  = 4'096;
+#else
 constexpr int32_t  kInstrumentCount = 5'000;
 constexpr int32_t  kRingCapacity    = 16'384;          // 2^14
 constexpr uint64_t kLogCapacity     = 536'870'912ULL;  // 2^29 (512Mi)
 constexpr int32_t  kWalSegmentRows  = 4'000'000;       // 244 MiB WAL segments
+#endif
 
 // A-share codes fit in [0, 1,000,000); a direct array gives O(1) id->index with
 // no hashing. 1e6 * 4 B = 3.8 MiB, resident in L3.

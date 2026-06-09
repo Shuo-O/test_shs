@@ -1,10 +1,16 @@
 tick_server
+tick_tests
+tick_bench
 *.o
 *.dSYM/
 .venv/
 
 wal/
 parquet_out/
+test_wal/
+test_wal_concurrent/
+bench_wal/
+bench_parquet/
 
 __pycache__/
 *.pyc
