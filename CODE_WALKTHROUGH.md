@@ -83,6 +83,11 @@
 在 `rings[]` 的下标，O(1) 且无分支预测抖动。首次见到某股票时 `register_instrument`
 分配一个下标（冷路径，全天只发生 ~5000 次）。
 
+条目类型是 `atomic<int32_t>`，跨进程读写是定义良好的行为且零成本：写者先初始化
+环头再 **release 发布**下标；读者 **relaxed 读取**即可——环数据自带 release/acquire
+边，读到陈旧的 `-1` 只是多报一次"未知股票"。（relaxed load 编译成普通 load，
+热路径无任何额外开销。）
+
 ### 2）每股票 seqlock 环（需求 A 的核心）
 
 每只股票一个定长环 `Ring { RingHead head; Slot slots[capacity]; }`，
@@ -160,11 +165,16 @@ writer.committed_seq.store(seq+1, release);                  // 发布给 tailer
 ```
 spin 读 committed_seq；处理 [read_seq, committed) 区间的记录：
   - rec.global_seq != read_seq → 槽已被环覆盖（极端落后才会），跳过
+  - 先拷贝整条记录，再复查一次 global_seq → 拷贝中途被绕圈覆盖的撕裂副本直接丢弃
   - 命中 09:25–15:00 → 进缓冲
   - 缓冲满 kWalFlushRows → write() 一批 + fsync()，然后 durable_seq = read_seq
   - 空闲时也把零头刷掉，保证低峰期延迟有界
+  - 空闲且缓冲为空 → durable_seq 跟进 read_seq（非窗口流量不会造成"幻影滞后"）
+  - 任何 write/fsync 失败 → fail-closed：停止消费，stop() 不再重试（避免半批
+    已写入后整缓冲重写造成重复行）
 ```
-`durable_seq` 只在 **fsync 之后**推进——它代表"已落盘"，与"已读取"区分开。
+`durable_seq` 表示"截至此序号的**窗口内**记录全部落盘"。正常推进发生在 fsync 之后；
+完全排空且无待刷数据时它等于 read_seq（测试断言收尾后 durable == committed）。
 
 **WAL → Parquet**：`scripts/wal_to_parquet.py` 离线把 64B 定长 WAL 解析出来，
 按 `instrumentId % 16` 分桶，写成 `date=YYYYMMDD/bucket=NN/part-*.parquet`。
@@ -214,7 +224,8 @@ All tests passed
 为聚焦核心，下列工程化内容在本分支被移除，但都是真实生产需要的，可作为"如何加固"的讨论点：
 
 - **可观测性**：吞吐/重试/覆盖计数器、写者心跳（liveness）、读者侧 `QueryStats` 已保留接口。
-- **持久化加固**：WAL 故障 fail-closed、durable 落后告警、CRC 校验、崩溃后按 WAL 回放重建。
+- **持久化加固**：durable 落后告警、CRC 校验、崩溃后按 WAL 回放重建（core 仅保留
+  最小 fail-closed：WAL 写失败即停止消费、不重试）。
 - **延迟优化**：热路径原始时钟戳（rdtsc/cntvct 替代 steady_clock，省 ~10ns/tick）、
   统计量周期性发布以避开竞争缓存行、查询端**分块批量 fence**把 latest-1000 的
   p99 从 ~22µs 降到 ~2µs（ARM 上；x86 因 fence 是空操作本就达标）。
