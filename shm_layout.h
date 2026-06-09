@@ -5,9 +5,9 @@
 // so the region is valid across every process that maps it.
 //
 // Three independently mmap'd regions:
-//   ControlRegion : superblock + id index + writer/tailer stat lines  (~3.8 MiB)
-//   RingRegion    : per-symbol seqlock rings for latest-n queries     (4.88 GiB)
-//   LogRegion     : append-only day log consumed by the storage tailer (32 GiB)
+//   ControlRegion : superblock + id->index map + the two progress cursors
+//   RingRegion    : per-symbol seqlock rings  (requirement A: latest-n query)
+//   LogRegion     : append-only day log        (requirement B: persistence)
 // Strategy processes map Control + Rings read-only and never touch the log.
 
 #include "config.h"
@@ -16,7 +16,7 @@
 #include <atomic>
 #include <cstdint>
 
-// Portable spin hint for seqlock retry loops (PAUSE / YIELD).
+// Spin hint for seqlock retry loops (PAUSE on x86, YIELD on arm).
 #if defined(__x86_64__) || defined(__i386__)
 #  define MDSYS_RELAX() __asm__ __volatile__("pause" ::: "memory")
 #elif defined(__aarch64__) || defined(__arm__)
@@ -39,75 +39,57 @@ enum QueryError : int {
     kErrOverwritten   = -3,  // ring wrapped under the reader
 };
 
-// --- Control region, cache-line partitioned by access pattern --------------
+// --- Control region --------------------------------------------------------
+// The two cursors live on their own cache lines: committed_seq is written by the
+// ingest thread, durable_seq by the tailer thread, so separating them avoids
+// false sharing between the two cores.
 
-// Line 0: static metadata, written once at init then read-only. Carries the
-// clock anchor used to convert raw recv_ticks to wall-clock ns offline.
+// Static metadata, written once at init then read-only.
 struct alignas(64) Superblock {
     uint64_t magic;
     uint32_t abi_version;
-    uint32_t trading_day;        // YYYYMMDD
-    uint32_t instrument_count;   // registered symbols
+    uint32_t trading_day;       // YYYYMMDD
+    uint32_t instrument_count;  // registered symbols
     uint32_t ring_capacity;
     uint64_t log_capacity;
-    uint64_t epoch_ns_at_start;  // wall-clock anchor (ns)
-    uint64_t ticks_at_start;     // fast_ticks() anchor
-    uint64_t ticks_per_sec;      // fast clock frequency
-    uint8_t  _pad[8];
+    uint8_t  _pad[32];
 };
 static_assert(sizeof(Superblock) == 64, "Superblock must be one cache line");
 
-// Line 1: the writer's hot publication. committed_seq is the canonical exclusive
-// end of the day log; records in [0, committed_seq) are visible to the tailer.
-struct alignas(64) WriterControl {
+// committed_seq is the exclusive end of the day log: records [0, committed_seq)
+// are fully written and visible to the tailer.
+struct alignas(64) WriterCursor {
     std::atomic<uint64_t> committed_seq;
-    std::atomic<uint64_t> heartbeat_ticks;
-    uint8_t _pad[48];
+    uint8_t _pad[56];
 };
-static_assert(sizeof(WriterControl) == 64, "WriterControl must be one cache line");
+static_assert(sizeof(WriterCursor) == 64, "WriterCursor must be one cache line");
 
-// Line 2: writer-only monitoring counters, published on a stride so the hot path
-// keeps this line in M state (never shared with the tailer or readers).
-struct alignas(64) WriterStats {
-    std::atomic<uint64_t> ticks_received;
-    std::atomic<uint64_t> ticks_in_window;
-    std::atomic<uint64_t> ticks_dropped;   // unknown / unregistered symbol
-    uint8_t _pad[40];
-};
-static_assert(sizeof(WriterStats) == 64, "WriterStats must be one cache line");
-
-// Line 3: tailer-owned progress. read_seq is the day-log consume cursor;
-// durable_seq advances only after fsync and is what the writer's overwrite guard
-// trusts. wal_faults is non-zero iff a WAL write/fsync has failed (fail-closed).
-struct alignas(64) TailerStats {
-    std::atomic<uint64_t> read_seq;
+// durable_seq is how far the tailer has fsynced to the WAL.
+struct alignas(64) TailerCursor {
     std::atomic<uint64_t> durable_seq;
-    std::atomic<uint64_t> log_overwrite_count;
-    std::atomic<uint64_t> wal_faults;
-    uint8_t _pad[32];
+    uint8_t _pad[56];
 };
-static_assert(sizeof(TailerStats) == 64, "TailerStats must be one cache line");
+static_assert(sizeof(TailerCursor) == 64, "TailerCursor must be one cache line");
 
 struct ControlRegion {
-    Superblock    sb;
-    WriterControl wc;
-    WriterStats   wstats;
-    TailerStats   tstats;
+    Superblock   sb;
+    WriterCursor writer;
+    TailerCursor tailer;
     // Direct id->index map. -1 == unregistered. Sized to the full code space.
-    int32_t       index[kIdSpace];
+    int32_t      index[kIdSpace];
 };
 
 // --- Per-symbol ring (seqlock) ---------------------------------------------
 
-// One cache line per slot. `seq` is the seqlock witness AND the slot's record
-// identity: while a writer fills position p it holds 2*(p+1)-1 (odd); once stable
-// it holds 2*(p+1) (even). The even value encodes the position, so a reader can
-// tell whether the slot still holds the record it asked for after a wrap.
+// One cache line per slot. `seq` is BOTH the seqlock witness and the slot's
+// record identity: while a writer fills ring position p, seq = 2*(p+1)-1 (odd);
+// once the payload is stable, seq = 2*(p+1) (even). Because the even value
+// encodes the position, a reader can tell whether the slot still holds the
+// record it asked for, even after the ring wraps -- no extra sequence field.
 struct alignas(64) Slot {
     std::atomic<uint64_t> seq;
-    uint64_t              global_seq;
     MDUniOrder            order;
-    uint8_t               _pad[8];
+    uint8_t               _pad[16];
 };
 static_assert(sizeof(Slot) == 64, "Slot must be one cache line");
 
@@ -131,10 +113,9 @@ struct RingRegion {
 
 struct alignas(64) LogRecord {
     uint64_t   global_seq;
-    uint64_t   recv_ticks;  // raw fast_ticks(); convert to ns via the anchor
     MDUniOrder order;
-    uint32_t   crc32;
     uint32_t   flags;
+    uint8_t    _pad[12];
 };
 static_assert(sizeof(LogRecord) == 64, "LogRecord must be one cache line");
 

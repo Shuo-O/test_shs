@@ -1,5 +1,4 @@
 #include "shm_manager.h"
-#include "clock.h"
 
 #include <cerrno>
 #include <cstring>
@@ -9,22 +8,9 @@
 
 namespace mdsys {
 namespace {
-
 std::string err(const char* what, const char* name) {
     return std::string(what) + " " + name + ": " + std::strerror(errno);
 }
-
-// Best-effort huge-page advice (transparent huge pages on Linux). A perf hint,
-// never fatal; a no-op where MADV_HUGEPAGE is unavailable.
-void advise_hugepages(void* p, size_t size) {
-#if defined(MADV_HUGEPAGE)
-    ::madvise(p, size, MADV_HUGEPAGE);
-#else
-    (void)p;
-    (void)size;
-#endif
-}
-
 }  // namespace
 
 ShmManager::~ShmManager() { close(); }
@@ -51,13 +37,12 @@ bool ShmManager::map_one(const char* name, size_t size, bool create_it, bool rea
     int prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
     void* p = ::mmap(nullptr, size, prot, MAP_SHARED, fd, 0);
     int saved = errno;
-    ::close(fd);
+    ::close(fd);  // the mapping keeps the region alive after the fd is closed
     if (p == MAP_FAILED) {
         errno = saved;
         error_ = err("mmap", name);
         return false;
     }
-    advise_hugepages(p, size);
     *out = p;
     return true;
 }
@@ -98,23 +83,20 @@ bool ShmManager::open(bool read_only, bool with_log) {
 }
 
 void ShmManager::initialize(uint32_t trading_day) {
-    // Zero only the small control region. The kernel already hands back zeroed
-    // pages for rings/log; faulting all 37 GiB in here would be gratuitous.
+    // Zero only the small control region. The kernel hands back zeroed pages for
+    // the multi-GiB rings/log, so faulting them all in here would be wasteful.
     std::memset(map_.ctrl, 0, sizeof(ControlRegion));
     for (int32_t i = 0; i < kIdSpace; ++i) {
         map_.ctrl->index[i] = -1;
     }
 
     Superblock& sb = map_.ctrl->sb;
-    sb.trading_day       = trading_day;
-    sb.instrument_count  = 0;
-    sb.ring_capacity     = static_cast<uint32_t>(kRingCapacity);
-    sb.log_capacity      = kLogCapacity;
-    sb.epoch_ns_at_start = wall_epoch_ns();
-    sb.ticks_at_start    = fast_ticks();
-    sb.ticks_per_sec     = fast_ticks_per_sec();
-    sb.abi_version       = kAbiVersion;
-    sb.magic             = kMagic;  // publish magic last
+    sb.trading_day      = trading_day;
+    sb.instrument_count = 0;
+    sb.ring_capacity    = static_cast<uint32_t>(kRingCapacity);
+    sb.log_capacity     = kLogCapacity;
+    sb.abi_version      = kAbiVersion;
+    sb.magic            = kMagic;  // publish magic last
 }
 
 void ShmManager::close() {

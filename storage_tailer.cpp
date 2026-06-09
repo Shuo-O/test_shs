@@ -41,52 +41,31 @@ bool StorageTailer::start() {
 void StorageTailer::stop() {
     running_.store(false, std::memory_order_release);
     if (thread_.joinable()) thread_.join();
-    // Best-effort final drain. If it fails, the fault is already recorded.
-    if (!faulted()) {
-        if (!flush()) record_fault();
-    }
-    if (!close_segment() && !faulted()) record_fault();
-}
-
-void StorageTailer::record_fault() {
-    faulted_.store(true, std::memory_order_release);
-    if (m_ && m_->ctrl) {
-        m_->ctrl->tstats.wal_faults.fetch_add(1, std::memory_order_relaxed);
-    }
+    flush();          // final drain
+    close_segment();
 }
 
 void StorageTailer::run() {
     auto committed = [&] {
-        return m_->ctrl->wc.committed_seq.load(std::memory_order_acquire);
+        return m_->ctrl->writer.committed_seq.load(std::memory_order_acquire);
     };
     while (running_.load(std::memory_order_acquire) || read_seq_ < committed()) {
-        if (faulted()) break;  // fail closed: stop consuming once WAL IO failed
-
         uint64_t end = committed();
         if (read_seq_ >= end) {
-            // Idle: flush a partial tail so durability lag stays bounded when the
-            // batch threshold is never reached at low volume.
-            if (!buf_.empty() && !flush()) { record_fault(); break; }
+            // Idle: flush a partial tail so durability lag stays bounded at low
+            // volume, then back off briefly.
+            if (!buf_.empty() && !flush()) break;
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             continue;
         }
         while (read_seq_ < end) {
             LogRecord& rec = m_->log->records[read_seq_ & (kLogCapacity - 1)];
-            if (rec.global_seq != read_seq_) {
-                // The circular slot was overwritten before we read it.
-                m_->ctrl->tstats.log_overwrite_count.fetch_add(1, std::memory_order_relaxed);
-                ++read_seq_;
-                continue;
-            }
+            // If the circular log already wrapped past this slot, skip it.
+            if (rec.global_seq != read_seq_) { ++read_seq_; continue; }
             if ((rec.flags & kFlagInWindow) != 0) buf_.push_back(rec);
             ++read_seq_;
-            if (buf_.size() >= kWalFlushRows) {
-                if (!flush()) { record_fault(); break; }
-            }
+            if (buf_.size() >= kWalFlushRows && !flush()) return;
         }
-        if (faulted()) break;
-        // Read progress (monitoring); durability advances only in flush().
-        m_->ctrl->tstats.read_seq.store(read_seq_, std::memory_order_release);
     }
 }
 
@@ -97,7 +76,7 @@ bool StorageTailer::flush() {
     size_t off = 0;
     while (off < buf_.size()) {
         if (rows_in_segment_ >= static_cast<uint64_t>(kWalSegmentRows)) {
-            if (!close_segment()) return false;
+            close_segment();
             if (!open_segment()) return false;
         }
         uint64_t room = static_cast<uint64_t>(kWalSegmentRows) - rows_in_segment_;
@@ -107,9 +86,8 @@ bool StorageTailer::flush() {
         rows_in_segment_ += rows;
     }
     if (::fsync(fd_) != 0) { error_ = err("fsync"); return false; }
-    // Durable: every in-window record up to read_seq_ is now on disk. Advance
-    // the cursor the writer's overwrite guard trusts -- only after fsync.
-    m_->ctrl->tstats.durable_seq.store(read_seq_, std::memory_order_release);
+    // Durable only after fsync: every in-window record up to read_seq_ is on disk.
+    m_->ctrl->tailer.durable_seq.store(read_seq_, std::memory_order_release);
     buf_.clear();
     return true;
 }
@@ -135,19 +113,13 @@ bool StorageTailer::write_all(const void* data, size_t bytes) {
             error_ = err("write wal");
             return false;
         }
-        if (n == 0) { error_ = "write wal returned zero"; return false; }
         done += static_cast<size_t>(n);
     }
     return true;
 }
 
-bool StorageTailer::close_segment() {
-    if (fd_ < 0) return true;
-    bool ok = true;
-    if (::fsync(fd_) != 0) { error_ = err("fsync on close"); ok = false; }
-    if (::close(fd_) != 0) { error_ = err("close wal"); ok = false; }
-    fd_ = -1;
-    return ok;
+void StorageTailer::close_segment() {
+    if (fd_ >= 0) { ::fsync(fd_); ::close(fd_); fd_ = -1; }
 }
 
 }  // namespace mdsys
