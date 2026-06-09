@@ -42,22 +42,24 @@ mdsys::Mapping* DemoMd::mapping() { return shm_ ? &shm_->mapping() : nullptr; }
 int32_t DemoMd::register_instrument(int32_t instrument_id) {
     if (instrument_id < 0 || instrument_id >= kIdSpace) return kErrUnknownSymbol;
     ControlRegion* c = shm_->mapping().ctrl;
-    int32_t existing = c->index[instrument_id];
+    int32_t existing = c->index[instrument_id].load(std::memory_order_relaxed);
     if (existing >= 0) return existing;
     if (next_symbol_index_ >= kInstrumentCount) return kErrUnknownSymbol;
 
-    int32_t idx = next_symbol_index_++;
+    int32_t idx = next_symbol_index_++;  // single writer: plain increment, no CAS
     Ring& ring = shm_->mapping().rings->rings[idx];
     ring.head.symbol_id = static_cast<uint32_t>(instrument_id);
     ring.head.write_seq.store(0, std::memory_order_relaxed);
-    c->index[instrument_id] = idx;  // single writer: no CAS needed
-    c->sb.instrument_count = static_cast<uint32_t>(next_symbol_index_);
+    // Publish the mapping after the ring head is initialized.
+    c->index[instrument_id].store(idx, std::memory_order_release);
+    c->sb.instrument_count.store(static_cast<uint32_t>(next_symbol_index_),
+                                 std::memory_order_relaxed);
     return idx;
 }
 
 int32_t DemoMd::resolve(int32_t instrument_id) {
     if (instrument_id < 0 || instrument_id >= kIdSpace) return -1;
-    int32_t idx = shm_->mapping().ctrl->index[instrument_id];
+    int32_t idx = shm_->mapping().ctrl->index[instrument_id].load(std::memory_order_relaxed);
     if (idx >= 0) return idx;
     return register_instrument(instrument_id);  // cold path, first tick per symbol
 }

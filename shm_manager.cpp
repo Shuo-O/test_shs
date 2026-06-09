@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace mdsys {
@@ -33,6 +34,21 @@ bool ShmManager::map_one(const char* name, size_t size, bool create_it, bool rea
         error_ = err("ftruncate", name);
         ::close(fd);
         return false;
+    }
+    if (!create_it) {
+        // Refuse to map a segment smaller than this build expects (stale
+        // segment from another config); touching it would SIGBUS, not error.
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            error_ = err("fstat", name);
+            ::close(fd);
+            return false;
+        }
+        if (st.st_size < static_cast<off_t>(size)) {
+            error_ = std::string(name) + ": segment smaller than expected (stale or mismatched build)";
+            ::close(fd);
+            return false;
+        }
     }
     int prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
     void* p = ::mmap(nullptr, size, prot, MAP_SHARED, fd, 0);
@@ -73,8 +89,10 @@ bool ShmManager::open(bool read_only, bool with_log) {
                      reinterpret_cast<void**>(&map_.log))) { close(); return false; }
     }
     const Superblock& sb = map_.ctrl->sb;
-    if (sb.magic != kMagic || sb.abi_version != kAbiVersion ||
-        sb.ring_capacity != static_cast<uint32_t>(kRingCapacity)) {
+    if (sb.magic.load(std::memory_order_acquire) != kMagic ||
+        sb.abi_version != kAbiVersion ||
+        sb.ring_capacity != static_cast<uint32_t>(kRingCapacity) ||
+        (with_log && sb.log_capacity != kLogCapacity)) {
         error_ = "shared-memory ABI mismatch";
         close();
         return false;
@@ -87,16 +105,18 @@ void ShmManager::initialize(uint32_t trading_day) {
     // the multi-GiB rings/log, so faulting them all in here would be wasteful.
     std::memset(map_.ctrl, 0, sizeof(ControlRegion));
     for (int32_t i = 0; i < kIdSpace; ++i) {
-        map_.ctrl->index[i] = -1;
+        map_.ctrl->index[i].store(-1, std::memory_order_relaxed);
     }
 
     Superblock& sb = map_.ctrl->sb;
     sb.trading_day      = trading_day;
-    sb.instrument_count = 0;
+    sb.instrument_count.store(0, std::memory_order_relaxed);
     sb.ring_capacity    = static_cast<uint32_t>(kRingCapacity);
     sb.log_capacity     = kLogCapacity;
     sb.abi_version      = kAbiVersion;
-    sb.magic            = kMagic;  // publish magic last
+    // Publish magic last with release so an attacher that acquire-loads it
+    // observes the fully initialized superblock and index.
+    sb.magic.store(kMagic, std::memory_order_release);
 }
 
 void ShmManager::close() {
