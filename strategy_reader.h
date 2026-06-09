@@ -18,9 +18,9 @@ struct QueryStats {
     uint64_t overwrites = 0;  // queries aborted because the ring wrapped
 };
 
-// Per-slot seqlock read, used as the fallback when a batched tile is found
-// unstable. Spins until the slot is stable, copies the payload, and reports an
-// overwrite if the slot no longer holds position `pos`.
+// Per-slot seqlock read: the n==1 fast path, and the fallback when a batched
+// tile is found unstable. Spins until the slot is stable, copies the payload,
+// and reports an overwrite if the slot no longer holds position `pos`.
 inline int read_slot_seqlock(const Ring& ring, uint64_t pos, MDUniOrder* out,
                              QueryStats* stats) {
     const Slot& slot = ring.slots[pos & (kRingCapacity - 1)];
@@ -60,6 +60,14 @@ inline int read_slot_seqlock(const Ring& ring, uint64_t pos, MDUniOrder* out,
 // seqlock invariant per slot still holds: version-read -> (fence) -> payload ->
 // (fence) -> version-recheck. A tile that is found unstable (a writer touched it
 // mid-read) falls back to the per-slot path, which spins to a stable copy.
+//
+// Consistency comes entirely from the per-slot identity witness: a slot is
+// accepted only if seq == stable_seq_for(pos) on both sides of the copy, so
+// every accepted copy is bit-exact for its position and the result equals the
+// ring content at the initial write_seq snapshot. No trailing re-read of
+// write_seq is needed; a writer lapping positions we already copied cannot
+// invalidate them, it can only make the snapshot slightly stale -- which is
+// true of any snapshot the moment it returns.
 inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
                           MDUniOrder* out, QueryStats* stats = nullptr) {
     if (m.ctrl == nullptr || m.rings == nullptr || out == nullptr || n <= 0) {
@@ -78,6 +86,13 @@ inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
     uint64_t avail = std::min<uint64_t>(write_seq, kRingCapacity);
     int count = static_cast<int>(std::min<uint64_t>(avail, static_cast<uint64_t>(n)));
     uint64_t start = write_seq - static_cast<uint64_t>(count);
+
+    // Latest-tick poll: one slot needs no tile batching -- the per-slot read is
+    // one acquire load + one fence instead of two fences.
+    if (count == 1) {
+        int rc = read_slot_seqlock(ring, start, out, stats);
+        return rc == kOk ? 1 : rc;
+    }
 
     constexpr int kTile = 256;  // 2 KiB version scratch; ~16 KiB working set
     uint64_t ver[kTile];
@@ -103,13 +118,13 @@ inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
 
         // Pass C: recheck. Stable iff the witness is unchanged, even, and still
         // names the position we wanted.
-        bool stable = true;
+        int unstable_at = -1;
         for (int k = 0; k < tile; ++k) {
             uint64_t pos = start + static_cast<uint64_t>(base + k);
             uint64_t s2 = ring.slots[pos & (kRingCapacity - 1)].seq.load(std::memory_order_relaxed);
             uint64_t want = stable_seq_for(pos);
             if (ver[k] != s2 || (ver[k] & 1u) != 0) {  // a writer touched this slot
-                stable = false;
+                unstable_at = k;
                 break;
             }
             if (ver[k] != want) {                       // stable but a newer record
@@ -117,22 +132,16 @@ inline int query_latest_n(const Mapping& m, int32_t symbol, int n,
                 return kErrOverwritten;
             }
         }
-        if (!stable) {
-            // Rare: re-read this tile slot-by-slot, spinning to a stable copy.
+        if (unstable_at >= 0) {
+            // Rare: slots before unstable_at are already validated; re-read the
+            // rest of the tile slot-by-slot, spinning each to a stable copy.
             if (stats) ++stats->retries;
-            for (int k = 0; k < tile; ++k) {
+            for (int k = unstable_at; k < tile; ++k) {
                 int rc = read_slot_seqlock(ring, start + static_cast<uint64_t>(base + k),
                                            &out[base + k], stats);
                 if (rc != kOk) return rc;
             }
         }
-    }
-
-    // Final wrap guard: a writer can lap the reader during the copy loop.
-    uint64_t after = ring.head.write_seq.load(std::memory_order_acquire);
-    if (after - start > static_cast<uint64_t>(kRingCapacity)) {
-        if (stats) ++stats->overwrites;
-        return kErrOverwritten;
     }
     return count;
 }
